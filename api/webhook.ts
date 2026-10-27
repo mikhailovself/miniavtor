@@ -6,81 +6,18 @@ const {
   GEMINI_API_KEY,
   GEMINI_MODEL = "gemini-2.5-flash",
   OWNER_ID, // твой Telegram user id: бот слушает только тебя
-  GROUP_CHAT_ID, // необязательно: запасной вариант, если нет базы
-  TOPICS, // необязательно: запасной вариант, если нет базы
+  GROUP_CHAT_ID, // необязательно: запасной вариант, если группа ещё не запомнена
 } = process.env;
 
 // Upstash Redis (бесплатно). Vercel сам добавляет эти переменные при подключении.
 const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL ?? process.env.KV_REST_API_URL;
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN ?? process.env.KV_REST_API_TOKEN;
 
-type TopicKey = "movies" | "debts" | "tracks" | "ttd" | "other";
-
-const TOPIC_META: Record<TopicKey, { emoji: string; label: string }> = {
-  movies: { emoji: "🎬", label: "Кино" },
-  debts: { emoji: "💸", label: "Долги" },
-  tracks: { emoji: "🎧", label: "Идеи для треков" },
-  ttd: { emoji: "✅", label: "ТТД" },
-  other: { emoji: "📝", label: "Заметки" },
-};
-const KEYS = Object.keys(TOPIC_META) as TopicKey[];
-
-// По каким словам в названии топика бот понимает, к какой теме он относится
-const KEYWORDS: Record<TopicKey, string[]> = {
-  movies: ["кино", "фильм", "сериал", "movie", "film"],
-  debts: ["долг", "должн", "debt"],
-  tracks: ["трек", "музык", "бит", "track", "music"],
-  ttd: ["ттд", "ttd", "дела", "задач", "todo"],
-  other: ["заметк", "разное", "другое", "other", "notes"],
-};
-
-function guessCategory(name: string): TopicKey | null {
-  const n = name.toLowerCase();
-  for (const k of KEYS) if (KEYWORDS[k].some((w) => n.includes(w))) return k;
-  return null;
-}
-
-const SYSTEM_PROMPT = `Ты личный секретарь владельца. Он пишет тебе сырые мысли, иногда сумбурно, с опечатками, голосом или пересланным текстом. Твоя задача: понять, о чём это, выбрать тему и вызвать функцию save_note с аккуратно оформленной заметкой.
-
-Темы:
-- movies: фильмы, сериалы, мультфильмы, которые хочется посмотреть. Укажи название, год если знаешь, кто посоветовал и почему интересно.
-- debts: кто кому должен денег. Заполни who, amount (число с валютой, по умолчанию ₽) и direction: "owes_me" если должны мне, "i_owe" если должен я. В body коротко за что.
-- tracks: идеи для музыки: строчки, темы, референсы, настроение, биты. Сохрани мысль как есть, но чище.
-- ttd: дела и задачи (things to do). Если названа дата или срок, укажи в deadline в формате ГГГГ-ММ-ДД, считая от сегодняшней даты. Если дел несколько, оформи списком в body.
-- other: всё, что не подходит выше.
-
-Правила оформления:
-- title: коротко, до 60 символов, без эмодзи.
-- body: чистый русский текст, без воды, можно списки через "•". Ничего не выдумывай: если данных нет, не добавляй их.
-- Не меняй смысл и не добавляй советов.
-- Если в сообщении несколько независимых заметок, вызови save_note несколько раз.
-- Если сообщение вообще непонятно и тему выбрать невозможно, всё равно сохрани в other.
-
-Сегодня: {{TODAY}} (часовой пояс Москва).`;
-
-const functionDeclaration = {
-  name: "save_note",
-  description: "Сохраняет оформленную заметку в нужную тему группы.",
-  parameters: {
-    type: "object",
-    properties: {
-      topic: { type: "string", enum: KEYS },
-      title: { type: "string" },
-      body: { type: "string" },
-      tags: { type: "array", items: { type: "string" } },
-      who: { type: "string", description: "Только для debts" },
-      amount: { type: "string", description: "Только для debts, например '3000 ₽'" },
-      direction: { type: "string", enum: ["owes_me", "i_owe"], description: "Только для debts" },
-      deadline: { type: "string", description: "Только для ttd, ГГГГ-ММ-ДД" },
-    },
-    required: ["topic", "title", "body"],
-  },
-};
-
 type Note = {
-  topic: TopicKey;
+  topic: string; // название топика
   title: string;
   body: string;
+  emoji?: string;
   tags?: string[];
   who?: string;
   amount?: string;
@@ -88,8 +25,13 @@ type Note = {
   deadline?: string;
 };
 
+type Topic = { id: number; name: string; desc?: string; label: string };
+
 const esc = (s: string) =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+// Названия, которые считаются «общим» топиком на случай, когда тема не подошла никуда
+const DEFAULT_WORDS = ["заметк", "разное", "другое", "other", "notes", "inbox"];
 
 // ---------- Telegram ----------
 
@@ -134,46 +76,119 @@ async function getGroup(): Promise<string | null> {
   return GROUP_CHAT_ID && GROUP_CHAT_ID !== "0" ? GROUP_CHAT_ID : null;
 }
 
-async function getMap(): Promise<Partial<Record<TopicKey, number>>> {
-  const map: Partial<Record<TopicKey, number>> = {};
-  try {
-    const env = JSON.parse(TOPICS ?? "{}");
-    for (const k of KEYS) if (Number(env[k]) > 0) map[k] = Number(env[k]);
-  } catch {}
-  const fromDb = toObj(await redis(["HGETALL", "tg:map"]));
-  for (const k of KEYS) if (Number(fromDb[k]) > 0) map[k] = Number(fromDb[k]);
-  return map;
+async function loadTopics(): Promise<Topic[]> {
+  const names = toObj(await redis(["HGETALL", "tg:topics"]));
+  const descs = toObj(await redis(["HGETALL", "tg:desc"]));
+  const list = Object.entries(names).map(([id, name]) => ({
+    id: Number(id),
+    name,
+    desc: descs[id],
+  }));
+  const count: Record<string, number> = {};
+  for (const t of list) count[t.name] = (count[t.name] ?? 0) + 1;
+  return list
+    .map((t) => ({ ...t, label: count[t.name] > 1 ? `${t.name} (#${t.id})` : t.name }))
+    .sort((a, b) => a.id - b.id);
 }
 
-async function getTopicNames(): Promise<Record<string, string>> {
-  return toObj(await redis(["HGETALL", "tg:topics"]));
+async function getDefault(): Promise<number | null> {
+  const d = await redis(["GET", "tg:default"]);
+  if (d) return Number(d);
+  const legacy = await redis(["HGET", "tg:map", "other"]); // совместимость со старой версией
+  return legacy ? Number(legacy) : null;
 }
 
-// Запоминает топик и пытается сама привязать его к теме по названию
+// Запоминает топик. Если название похоже на «Заметки» и запасного топика ещё нет, делает его запасным.
 async function registerTopic(thread: number, name: string) {
   const known = await redis(["HGET", "tg:topics", String(thread)]);
   if (known !== name) await redis(["HSET", "tg:topics", String(thread), name]);
-  const cat = guessCategory(name);
-  let bound = false;
-  if (cat) {
-    const cur = await redis(["HGET", "tg:map", cat]);
-    if (!cur) {
-      await redis(["HSET", "tg:map", cat, String(thread)]);
-      bound = true;
-    } else {
-      bound = String(cur) === String(thread);
-    }
+  let madeDefault = false;
+  if (DEFAULT_WORDS.some((w) => name.toLowerCase().includes(w)) && !(await getDefault())) {
+    await redis(["SET", "tg:default", String(thread)]);
+    madeDefault = true;
   }
-  return { cat, bound };
+  return { madeDefault };
 }
 
-// ---------- Оформление и Gemini ----------
+// ---------- Gemini ----------
+
+function buildSystemPrompt(topics: Topic[], fallback: Topic | undefined): string {
+  const today = new Date().toLocaleDateString("sv-SE", { timeZone: "Europe/Moscow" });
+  const list = topics
+    .map((t) => `- «${t.label}»${t.desc ? `: ${t.desc}` : ""}`)
+    .join("\n");
+  return `Ты личный секретарь владельца. Он пишет тебе сырые мысли, иногда сумбурно, с опечатками, голосом или пересланным текстом. Твоя задача: понять, о чём это, выбрать подходящий топик из списка и вызвать функцию save_note с аккуратно оформленной заметкой.
+
+Топики его группы (выбирай только из них, название пиши ровно как в списке):
+${list}
+
+Как выбирать:
+- Смотри на смысл и на название топика. «Купить» это покупки, «Идеи для YouTube» это идеи для видео и так далее.
+- Если подходят два топика, выбери более конкретный.
+${fallback ? `- Если ничего не подходит, выбери «${fallback.label}».` : "- Если ничего не подходит, выбери самый близкий по смыслу."}
+
+Правила оформления:
+- title: коротко, до 60 символов, без эмодзи.
+- emoji: один эмодзи, подходящий по смыслу заметки.
+- body: чистый русский текст, без воды, можно списки через «•». Ничего не выдумывай: если данных нет, не добавляй их. Не меняй смысл, не добавляй советов.
+- Если в заметке про деньги кто-то кому-то должен, заполни who, amount (с валютой, по умолчанию ₽) и direction: "owes_me" если должны мне, "i_owe" если должен я.
+- Если назван срок или дата (дело, напоминание, план), заполни deadline в формате ГГГГ-ММ-ДД, считая от сегодняшней даты.
+- Ссылки оставляй как есть в body.
+- Если в сообщении несколько независимых заметок, вызови save_note несколько раз.
+
+Сегодня: ${today} (часовой пояс Москва).`;
+}
+
+async function extractNotes(text: string, topics: Topic[], fallback: Topic | undefined): Promise<Note[]> {
+  const declaration = {
+    name: "save_note",
+    description: "Сохраняет оформленную заметку в нужный топик группы.",
+    parameters: {
+      type: "object",
+      properties: {
+        topic: { type: "string", enum: topics.map((t) => t.label) },
+        title: { type: "string" },
+        body: { type: "string" },
+        emoji: { type: "string" },
+        tags: { type: "array", items: { type: "string" } },
+        who: { type: "string", description: "Только для долгов" },
+        amount: { type: "string", description: "Только для долгов, например '3000 ₽'" },
+        direction: { type: "string", enum: ["owes_me", "i_owe"], description: "Только для долгов" },
+        deadline: { type: "string", description: "Срок, ГГГГ-ММ-ДД" },
+      },
+      required: ["topic", "title", "body"],
+    },
+  };
+
+  const r = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY ?? "" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: buildSystemPrompt(topics, fallback) }] },
+        contents: [{ role: "user", parts: [{ text }] }],
+        tools: [{ functionDeclarations: [declaration] }],
+        toolConfig: { functionCallingConfig: { mode: "ANY", allowedFunctionNames: ["save_note"] } },
+      }),
+    }
+  );
+  const data = await r.json();
+  if (!r.ok) {
+    console.error("Gemini error", r.status, JSON.stringify(data));
+    throw new Error("Gemini request failed");
+  }
+  const parts: any[] = data.candidates?.[0]?.content?.parts ?? [];
+  return parts
+    .filter((p) => p.functionCall?.name === "save_note")
+    .map((p) => p.functionCall.args as Note);
+}
 
 function formatNote(n: Note): string {
-  const meta = TOPIC_META[n.topic] ?? TOPIC_META.other;
-  const lines: string[] = [`${meta.emoji} <b>${esc(n.title)}</b>`, ""];
+  const emoji = n.emoji && n.emoji.length <= 8 ? n.emoji : "📌";
+  const lines: string[] = [`${emoji} <b>${esc(n.title)}</b>`, ""];
 
-  if (n.topic === "debts" && (n.who || n.amount)) {
+  if (n.who || n.amount) {
     const who = n.who ? esc(n.who) : "?";
     const amount = n.amount ? esc(n.amount) : "";
     lines.push(
@@ -191,64 +206,28 @@ function formatNote(n: Note): string {
   return lines.join("\n");
 }
 
-async function extractNotes(text: string): Promise<Note[]> {
-  const today = new Date().toLocaleDateString("sv-SE", { timeZone: "Europe/Moscow" });
-  const r = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY ?? "" },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT.replace("{{TODAY}}", today) }] },
-        contents: [{ role: "user", parts: [{ text }] }],
-        tools: [{ functionDeclarations: [functionDeclaration] }],
-        toolConfig: { functionCallingConfig: { mode: "ANY", allowedFunctionNames: ["save_note"] } },
-      }),
-    }
-  );
-  const data = await r.json();
-  if (!r.ok) {
-    console.error("Gemini error", r.status, JSON.stringify(data));
-    throw new Error("Gemini request failed");
-  }
-  const parts: any[] = data.candidates?.[0]?.content?.parts ?? [];
-  return parts
-    .filter((p) => p.functionCall?.name === "save_note")
-    .map((p) => p.functionCall.args as Note);
-}
-
 // ---------- Статус для команды /topics ----------
 
 async function statusText(): Promise<string> {
   const group = await getGroup();
-  const map = await getMap();
-  const names = await getTopicNames();
+  const topics = await loadTopics();
+  const def = await getDefault();
   const lines: string[] = [];
 
-  lines.push(group ? `Группа: ${group}` : "Группа пока не определена. Напиши любое сообщение в своей группе (или /ids в топике).");
+  lines.push(group ? `Группа подключена (${group})` : "Группа пока не определена. Напиши /ids в любом топике группы.");
   lines.push("");
-  lines.push("Куда что попадает:");
-  for (const k of KEYS) {
-    const t = map[k];
-    lines.push(
-      `${TOPIC_META[k].emoji} ${TOPIC_META[k].label}: ` +
-        (t ? `«${names[String(t)] ?? "?"}» (${t})` : "не привязано ⚠️")
-    );
+
+  if (!topics.length) {
+    lines.push("Топиков пока нет. Зайди в каждый нужный топик группы и напиши там /ids.");
+  } else {
+    lines.push(`Топиков известно: ${topics.length}`);
+    for (const t of topics) {
+      lines.push(`• ${t.name}${t.id === def ? " (запасной)" : ""}${t.desc ? `: ${t.desc}` : ""}`);
+    }
   }
 
-  const boundIds = new Set(Object.values(map).map(String));
-  const free = Object.entries(names).filter(([id]) => !boundIds.has(id));
-  if (free.length) {
-    lines.push("", "Топики без привязки:");
-    for (const [id, n] of free) lines.push(`• «${n}» (${id})`);
-  }
-
-  const unbound = KEYS.filter((k) => !map[k]);
-  if (unbound.length) {
-    lines.push(
-      "",
-      "Чтобы привязать вручную, зайди в нужный топик и напиши /bind и тему: " + KEYS.join(", ") + "."
-    );
+  if (topics.length && !def) {
+    lines.push("", "Запасной топик (куда класть то, что никуда не подошло) не задан. Зайди в нужный топик и напиши /default.");
   }
   if (!REDIS_URL) {
     lines.push("", "⚠️ База не подключена: бот не запоминает топики. Подключи Upstash Redis в Vercel (Storage).");
@@ -259,12 +238,14 @@ async function statusText(): Promise<string> {
 // ---------- Основной обработчик ----------
 
 const HELP =
-  "Пиши мне что угодно: кино, долги, идеи для треков, дела. Я разложу всё по темам в группе.\n\n" +
-  "Команды:\n" +
-  "/topics: показать, куда что попадает\n\n" +
-  "В группе (в нужном топике):\n" +
+  "Пиши мне что угодно: идеи, долги, фильмы, дела, ссылки. Я сам выберу топик в группе и красиво оформлю.\n\n" +
+  "В личке:\n" +
+  "/topics: какие топики я знаю\n\n" +
+  "В группе (в нужном топике, только ты):\n" +
   "/ids: запомнить этот топик\n" +
-  "/bind тема: привязать топик вручную (movies, debts, tracks, ttd, other)";
+  "/desc текст: подсказать мне, что сюда класть (например «фильмы и сериалы, которые хочу посмотреть»)\n" +
+  "/default: сделать этот топик запасным\n" +
+  "/forget: забыть этот топик";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST") return res.status(200).send("ok");
@@ -281,7 +262,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const chatId = msg.chat.id;
     const fromOwner = String(msg.from?.id) === String(OWNER_ID);
     const text: string = msg.text ?? msg.caption ?? "";
-    const cmd = text.trim().split(/\s+/)[0].split("@")[0].toLowerCase();
+    const parts = text.trim().split(/\s+/);
+    const cmd = parts[0].split("@")[0].toLowerCase();
+    const arg = text.trim().slice(parts[0].length).trim();
 
     // ===== Сообщения в группе =====
     if (msg.chat.type !== "private") {
@@ -300,40 +283,45 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         msg.forum_topic_edited?.name ??
         msg.reply_to_message?.forum_topic_created?.name;
 
-      let learned: { cat: TopicKey | null; bound: boolean } | null = null;
+      let madeDefault = false;
       if (REDIS_URL && threadId && topicName && (service || fromOwner)) {
-        learned = await registerTopic(threadId, topicName);
+        madeDefault = (await registerTopic(threadId, topicName)).madeDefault;
       }
 
       const say = (t: string) =>
         tg("sendMessage", { chat_id: chatId, message_thread_id: threadId, text: t });
 
-      if (cmd === "/ids" && fromOwner) {
+      if (fromOwner && ["/ids", "/desc", "/default", "/forget"].includes(cmd)) {
         if (!REDIS_URL) {
-          await say(`chat_id: ${chatId}\nthread_id: ${threadId ?? "нет"}\n\nБаза не подключена, впиши эти числа в Vercel вручную.`);
+          await say("База не подключена. Подключи Upstash Redis в Vercel (Storage) и сделай Redeploy.");
         } else if (!threadId) {
-          await say("Это общий топик (General), его я не запоминаю. Создай отдельный топик, например «Заметки».");
-        } else if (!topicName) {
-          await say(`Не вижу название топика (thread_id ${threadId}). Привяжи вручную: /bind movies, debts, tracks, ttd или other.`);
-        } else if (!learned?.cat) {
-          await say(`Запомнил топик «${topicName}» (${threadId}), но не понял, к какой теме он относится. Напиши /bind movies, debts, tracks, ttd или other.`);
-        } else if (!learned.bound) {
-          await say(`Топик «${topicName}» запомнил, но тема «${TOPIC_META[learned.cat].label}» уже привязана к другому топику. Чтобы перепривязать сюда: /bind ${learned.cat}`);
-        } else {
-          await say(`Готово: «${topicName}» (${threadId}) → ${TOPIC_META[learned.cat].emoji} ${TOPIC_META[learned.cat].label}`);
-        }
-      } else if (cmd === "/bind" && fromOwner) {
-        const key = text.trim().split(/\s+/)[1]?.toLowerCase() as TopicKey | undefined;
-        if (!REDIS_URL) {
-          await say("База не подключена, привязывать некуда. Подключи Upstash Redis в Vercel (Storage).");
-        } else if (!threadId) {
-          await say("В общем топике (General) привязать нельзя. Создай отдельный топик.");
-        } else if (!key || !KEYS.includes(key)) {
-          await say("Напиши так: /bind movies (или debts, tracks, ttd, other)");
-        } else {
-          await redis(["HSET", "tg:map", key, String(threadId)]);
-          if (topicName) await redis(["HSET", "tg:topics", String(threadId), topicName]);
-          await say(`Привязал этот топик к теме ${TOPIC_META[key].emoji} ${TOPIC_META[key].label}`);
+          await say("Это общий топик (General), его я не запоминаю. Команды работают в обычных топиках.");
+        } else if (cmd === "/ids") {
+          if (!topicName) {
+            await say(`Не вижу название этого топика (thread_id ${threadId}). Попробуй переименовать топик и снова написать /ids.`);
+          } else {
+            await say(
+              `Запомнил «${topicName}». Теперь могу складывать сюда заметки.` +
+                (madeDefault ? "\nЭтот топик стал запасным: сюда пойдёт то, что никуда не подошло." : "")
+            );
+          }
+        } else if (cmd === "/desc") {
+          if (!arg) {
+            await say("Напиши так: /desc что сюда класть. Например: /desc фильмы и сериалы, которые хочу посмотреть");
+          } else {
+            if (topicName) await redis(["HSET", "tg:topics", String(threadId), topicName]);
+            await redis(["HSET", "tg:desc", String(threadId), arg.slice(0, 300)]);
+            await say("Записал подсказку для этого топика.");
+          }
+        } else if (cmd === "/default") {
+          await redis(["SET", "tg:default", String(threadId)]);
+          await say("Теперь это запасной топик: сюда пойдёт то, что никуда не подошло.");
+        } else if (cmd === "/forget") {
+          await redis(["HDEL", "tg:topics", String(threadId)]);
+          await redis(["HDEL", "tg:desc", String(threadId)]);
+          const def = await redis(["GET", "tg:default"]);
+          if (def && Number(def) === threadId) await redis(["DEL", "tg:default"]);
+          await say("Забыл этот топик. Чтобы вернуть, напиши /ids.");
         }
       }
       return res.status(200).send("ok");
@@ -358,16 +346,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     const group = await getGroup();
-    if (!group) {
+    const topics = await loadTopics();
+
+    if (!group || !topics.length) {
       await tg("sendMessage", {
         chat_id: chatId,
-        text: "Я ещё не знаю твою группу. Напиши любое сообщение в группе (лучше /ids в нужном топике), потом повтори.",
+        text: "Я ещё не знаю твои топики. Зайди в каждый нужный топик группы и напиши там /ids, потом проверь командой /topics.",
       });
       return res.status(200).send("ok");
     }
 
-    const map = await getMap();
-    const notes = await extractNotes(text);
+    const defId = await getDefault();
+    const fallback = topics.find((t) => t.id === defId);
+    const notes = await extractNotes(text, topics, fallback);
 
     if (!notes.length) {
       await tg("sendMessage", { chat_id: chatId, text: "Не смог разобрать, попробуй переформулировать." });
@@ -376,25 +367,23 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const saved: string[] = [];
     for (const note of notes) {
-      const meta = TOPIC_META[note.topic] ?? TOPIC_META.other;
-      const direct = map[note.topic];
-      const thread = direct ?? map.other;
-
+      const target = topics.find((t) => t.label === note.topic) ?? fallback;
+      if (!target) {
+        saved.push(`⚠️ «${note.title}»: не нашёл подходящий топик`);
+        continue;
+      }
       const r = await tg("sendMessage", {
         chat_id: group,
-        ...(thread ? { message_thread_id: thread } : {}),
+        message_thread_id: target.id,
         text: formatNote(note),
         parse_mode: "HTML",
         disable_web_page_preview: true,
       });
-
-      if (!r.ok) {
-        saved.push(`⚠️ ${meta.label}: не отправилось (${r.description ?? "ошибка"})`);
-      } else if (!direct) {
-        saved.push(`${meta.emoji} ${meta.label}: ${note.title} (топик не привязан, положил в «Заметки»; смотри /topics)`);
-      } else {
-        saved.push(`${meta.emoji} ${meta.label}: ${note.title}`);
-      }
+      saved.push(
+        r.ok
+          ? `${note.emoji && note.emoji.length <= 8 ? note.emoji : "📌"} ${target.name}: ${note.title}`
+          : `⚠️ ${target.name}: не отправилось (${r.description ?? "ошибка"})`
+      );
     }
 
     await tg("sendMessage", { chat_id: chatId, text: `Записал:\n${saved.join("\n")}` });
