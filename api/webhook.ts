@@ -199,7 +199,7 @@ async function extractNotes(text: string, topics: Topic[], fallback: Topic | und
   const data = await r.json();
   if (!r.ok) {
     console.error("Gemini error", r.status, JSON.stringify(data));
-    throw new Error("Gemini request failed");
+    throw new Error(`Gemini ${r.status}: ${data?.error?.message ?? "request failed"} (model ${GEMINI_MODEL})`);
   }
   const parts: any[] = data.candidates?.[0]?.content?.parts ?? [];
   return parts
@@ -722,7 +722,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // Всё равно отвечаем 200, иначе Telegram будет слать сообщение повторно
     const chatId = req.body?.message?.chat?.id;
     const isPrivate = req.body?.message?.chat?.type === "private";
-    if (chatId && isPrivate) await tg("sendMessage", { chat_id: chatId, text: "Бля, че-т сломалось. Глянь логи в Vercel, даун" });
+    if (chatId && isPrivate) await tg("sendMessage", { chat_id: chatId, text: `Бля, че-т сломалось. Глянь логи в Vercel, даун\n\nОшибка: ${String((e as any)?.message ?? e).slice(0, 300)}` });
   }
 
   return res.status(200).send("ok");
