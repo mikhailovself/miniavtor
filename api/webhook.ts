@@ -4,7 +4,7 @@ const {
   TELEGRAM_BOT_TOKEN,
   WEBHOOK_SECRET,
   GEMINI_API_KEY,
-  GEMINI_MODEL = "gemini-2.5-flash",
+  GEMINI_MODEL = "gemini-3.5-flash-lite",
   OWNER_ID, // твой Telegram user id: бот слушает только тебя
   GROUP_CHAT_ID, // необязательно: запасной вариант, если группа ещё не запомнена
 } = process.env;
