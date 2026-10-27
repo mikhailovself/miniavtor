@@ -120,10 +120,10 @@ async function registerTopic(thread: number, name: string) {
 
 function buildSystemPrompt(topics: Topic[], fallback: Topic | undefined): string {
   const today = new Date().toLocaleDateString("sv-SE", { timeZone: "Europe/Moscow" });
-  const list = topics
-    .map((t) => `- «${t.label}»${t.desc ? `: ${t.desc}` : ""}`)
-    .join("\n");
-  return `Ты личный секретарь владельца. Он пишет тебе сырые мысли, иногда сумбурно, с опечатками, голосом или пересланным текстом. Твоя задача: понять, о чём это, выбрать подходящий топик из списка и вызвать функцию save_note с аккуратно оформленной заметкой.
+  const list = topics.length
+    ? topics.map((t) => `- «${t.label}»${t.desc ? `: ${t.desc}` : ""}`).join("\n")
+    : "(топики пока не заданы, сохранять заметки нельзя)";
+  return `Ты личный секретарь владельца. Он пишет тебе сырые мысли, иногда сумбурно, с опечатками, голосом или пересланным текстом. Твоя задача: сначала понять, это заметка или просто разговор. Заметка: выбрать подходящий топик из списка и вызвать функцию save_note с аккуратно оформленной заметкой. Разговор: вызвать функцию chat_reply с коротким ответом, ничего не сохраняя.
 
 Топики его группы (выбирай только из них, название пиши ровно как в списке):
 ${list}
@@ -133,12 +133,21 @@ ${list}
 - Если подходят два топика, выбери более конкретный.
 ${fallback ? `- Если ничего не подходит, выбери «${fallback.label}».` : "- Если ничего не подходит, выбери самый близкий по смыслу."}
 
+Заметка или разговор:
+- Заметка: человек хочет что-то запомнить или сохранить. Дела, планы, идеи, долги, покупки, фильмы, треки, игры, ссылки, даты, «надо», «не забыть», «запиши», «кинь в заметки». Ссылка без комментария тоже заметка.
+- Разговор: приветствие, «как дела», вопрос к тебе, болтовня, шутки, реакции, жалобы, обсуждение, просьба что-то объяснить или обсудить. В разговоре вызывай chat_reply, save_note не вызывай, ничего никуда не пишется.
+- Если сомневаешься, заметка это или нет, это разговор. Если человек прямо пишет «запиши» или «в заметки», это точно заметка.
+- Если есть и то и другое (заметка и вопрос), вызови оба.
+- Ответ в разговоре пиши как Влад в телеге другу: 1-3 коротких строки, по правилам стиля ниже. Не выдумывай факты о его жизни, не знаешь: «хз». Ты бот-секретарь, не притворяйся человеком: если спросят прямо, скажи что ты мини.автор, бот.
+- Ты видишь последние сообщения диалога, можешь на них опираться.
+- Если топиков нет, save_note недоступен: на просьбу записать ответь, что топики ещё не знаешь и надо написать /ids в нужном топике группы.
+
 Правила оформления:
 - title: коротко, до 60 символов, без эмодзи.
 - emoji: один эмодзи, подходящий по смыслу заметки.
 - body: коротко, без воды, можно списки через «•». Ничего не выдумывай: если данных нет, не добавляй их. Не меняй смысл, не добавляй советов.
 
-Стиль (это важно): ты мини.автор, дурная мини-версия Влада. Пиши title и body так, как Влад пишет близкому другу в телеге:
+Стиль (это важно): ты мини.автор, дурная мини-версия Влада. Пиши title, body и ответы в разговоре так, как Влад пишет близкому другу в телеге:
 - Коротко. Типичная его реплика это 2-4 слова. Без вступлений и воды, одна мысль на строку. Можно разбить на несколько коротких строк вместо одного абзаца.
 - Первая буква чаще заглавная, но в конце точки нет вообще. Запятых почти нет, восклицательных знаков нет, многоточий нет. Вопросительный знак только если это реально вопрос.
 - Разговорные сокращения: че, щас, ща, хз, всм, норм, мож, мб, чет, тож, поч, пон, тип, вроде, прям, ну да, угу, неа, ок, окей, ага. Не пихай все сразу, 1-2 на заметку.
@@ -162,49 +171,224 @@ ${fallback ? `- Если ничего не подходит, выбери «${fa
 Сегодня: ${today} (часовой пояс Москва).`;
 }
 
-async function extractNotes(text: string, topics: Topic[], fallback: Topic | undefined): Promise<Note[]> {
-  const declaration = {
-    name: "save_note",
-    description: "Сохраняет оформленную заметку в нужный топик группы.",
-    parameters: {
-      type: "object",
-      properties: {
-        topic: { type: "string", enum: topics.map((t) => t.label) },
-        title: { type: "string" },
-        body: { type: "string" },
-        emoji: { type: "string" },
-        tags: { type: "array", items: { type: "string" } },
-        who: { type: "string", description: "Только для долгов" },
-        amount: { type: "string", description: "Только для долгов, например '3000 ₽'" },
-        direction: { type: "string", enum: ["owes_me", "i_owe"], description: "Только для долгов" },
-        deadline: { type: "string", description: "Срок, ГГГГ-ММ-ДД" },
-      },
-      required: ["topic", "title", "body"],
-    },
-  };
+type Provider = { name: string; kind: "gemini" | "openai"; model: string; key: string; base?: string };
 
-  const r = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+// Порядок: Gemini, потом LLM2_*, LLM3_*, LLM4_*. Если один отвалился (лимит, ошибка, таймаут), берём следующий.
+function getProviders(): Provider[] {
+  const list: Provider[] = [];
+  if (GEMINI_API_KEY) list.push({ name: "Gemini", kind: "gemini", model: GEMINI_MODEL, key: GEMINI_API_KEY });
+  for (const n of [2, 3, 4]) {
+    const key = process.env[`LLM${n}_API_KEY`];
+    const base = process.env[`LLM${n}_BASE_URL`];
+    const model = process.env[`LLM${n}_MODEL`];
+    if (key && base && model) {
+      list.push({ name: process.env[`LLM${n}_NAME`] ?? `LLM${n}`, kind: "openai", model, key, base: base.replace(/\/+$/, "") });
+    }
+  }
+  return list;
+}
+
+class ProviderError extends Error {
+  status: number;
+  constructor(status: number, msg: string) {
+    super(msg);
+    this.status = status;
+  }
+}
+
+async function fetchT(url: string, init: RequestInit, ms: number): Promise<Response> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    return await fetch(url, { ...init, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Если провайдер упал, помечаем его в Redis на время, чтобы следующие сообщения не ждали зря
+async function isCooling(p: Provider): Promise<boolean> {
+  try {
+    return !!(await redis(["GET", `tg:cool:${p.name}`]));
+  } catch {
+    return false;
+  }
+}
+async function coolDown(p: Provider, status: number) {
+  const sec = status === 429 ? 300 : status === 401 || status === 403 || status === 404 ? 3600 : 60;
+  try {
+    await redis(["SET", `tg:cool:${p.name}`, "1", "EX", sec]);
+  } catch {}
+}
+
+const NOTE_DECLARATION = {
+  name: "save_note",
+  description: "Сохраняет оформленную заметку в нужный топик группы.",
+  parameters: {
+    type: "object",
+    properties: {
+      topic: { type: "string" } as Record<string, unknown>,
+      title: { type: "string" },
+      body: { type: "string" },
+      emoji: { type: "string" },
+      tags: { type: "array", items: { type: "string" } },
+      who: { type: "string", description: "Только для долгов" },
+      amount: { type: "string", description: "Только для долгов, например '3000 ₽'" },
+      direction: { type: "string", enum: ["owes_me", "i_owe"], description: "Только для долгов" },
+      deadline: { type: "string", description: "Срок, ГГГГ-ММ-ДД" },
+    },
+    required: ["topic", "title", "body"],
+  },
+};
+
+const CHAT_DECLARATION = {
+  name: "chat_reply",
+  description: "Короткий ответ в обычном разговоре. Ничего не сохраняется в топики.",
+  parameters: {
+    type: "object",
+    properties: { text: { type: "string" } },
+    required: ["text"],
+  },
+};
+
+type Turn = { r: "u" | "b"; t: string };
+type ChatTurn = { role: "user" | "assistant"; text: string };
+type Parsed = { notes: Note[]; reply: string };
+
+// Последние реплики диалога, чтобы бот не терял нить (хранятся сутки в Redis)
+async function loadHistory(): Promise<Turn[]> {
+  try {
+    const raw = await redis(["GET", "tg:hist"]);
+    const a = raw ? JSON.parse(String(raw)) : [];
+    return Array.isArray(a) ? a : [];
+  } catch {
+    return [];
+  }
+}
+
+async function saveHistory(h: Turn[], userText: string, reply: string, notes: Note[]) {
+  const next: Turn[] = [...h, { r: "u", t: userText.slice(0, 500) }];
+  const botText = [reply, notes.length ? `[записал в топики: ${notes.map((n) => n.title).join("; ")}]` : ""]
+    .filter(Boolean)
+    .join("\n");
+  if (botText) next.push({ r: "b", t: botText.slice(0, 500) });
+  try {
+    await redis(["SET", "tg:hist", JSON.stringify(next.slice(-10)), "EX", 86400]);
+  } catch {}
+}
+
+function buildTurns(history: Turn[], text: string): ChatTurn[] {
+  const out: ChatTurn[] = [];
+  for (const h of [...history, { r: "u" as const, t: text }]) {
+    const role: ChatTurn["role"] = h.r === "u" ? "user" : "assistant";
+    const last = out[out.length - 1];
+    if (last && last.role === role) last.text += "\n" + h.t;
+    else out.push({ role, text: h.t });
+  }
+  while (out.length && out[0].role !== "user") out.shift();
+  return out;
+}
+
+async function callGemini(p: Provider, turns: ChatTurn[], system: string, decls: any[]): Promise<Parsed> {
+  const r = await fetchT(
+    `https://generativelanguage.googleapis.com/v1beta/models/${p.model}:generateContent`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY ?? "" },
+      headers: { "Content-Type": "application/json", "x-goog-api-key": p.key },
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: buildSystemPrompt(topics, fallback) }] },
-        contents: [{ role: "user", parts: [{ text }] }],
-        tools: [{ functionDeclarations: [declaration] }],
-        toolConfig: { functionCallingConfig: { mode: "ANY", allowedFunctionNames: ["save_note"] } },
+        systemInstruction: { parts: [{ text: system }] },
+        contents: turns.map((t) => ({ role: t.role === "user" ? "user" : "model", parts: [{ text: t.text }] })),
+        tools: [{ functionDeclarations: decls }],
+        toolConfig: { functionCallingConfig: { mode: "ANY", allowedFunctionNames: decls.map((d) => d.name) } },
       }),
-    }
+    },
+    9000
   );
-  const data = await r.json();
-  if (!r.ok) {
-    console.error("Gemini error", r.status, JSON.stringify(data));
-    throw new Error(`Gemini ${r.status}: ${data?.error?.message ?? "request failed"} (model ${GEMINI_MODEL})`);
-  }
+  const data: any = await r.json().catch(() => ({}));
+  if (!r.ok) throw new ProviderError(r.status, String(data?.error?.message ?? "request failed").slice(0, 120));
   const parts: any[] = data.candidates?.[0]?.content?.parts ?? [];
-  return parts
-    .filter((p) => p.functionCall?.name === "save_note")
-    .map((p) => p.functionCall.args as Note);
+  const out: Parsed = { notes: [], reply: "" };
+  for (const x of parts) {
+    if (x.functionCall?.name === "save_note") out.notes.push(x.functionCall.args as Note);
+    if (x.functionCall?.name === "chat_reply" && x.functionCall.args?.text) out.reply = String(x.functionCall.args.text);
+  }
+  return out;
+}
+
+// Любой API в формате OpenAI: Groq, Mistral, Cerebras, OpenRouter, DeepSeek и так далее
+async function callOpenAI(p: Provider, turns: ChatTurn[], system: string, decls: any[]): Promise<Parsed> {
+  const r = await fetchT(
+    `${p.base}/chat/completions`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${p.key}` },
+      body: JSON.stringify({
+        model: p.model,
+        messages: [
+          { role: "system", content: system },
+          ...turns.map((t) => ({ role: t.role, content: t.text })),
+        ],
+        tools: decls.map((d) => ({ type: "function", function: d })),
+        tool_choice: decls.length === 1 ? { type: "function", function: { name: decls[0].name } } : "required",
+      }),
+    },
+    9000
+  );
+  const data: any = await r.json().catch(() => ({}));
+  if (!r.ok) throw new ProviderError(r.status, String(data?.error?.message ?? "request failed").slice(0, 120));
+  const calls: any[] = data.choices?.[0]?.message?.tool_calls ?? [];
+  const out: Parsed = { notes: [], reply: "" };
+  for (const c of calls) {
+    try {
+      const args = JSON.parse(c.function?.arguments ?? "{}");
+      if (c.function?.name === "save_note") out.notes.push(args as Note);
+      if (c.function?.name === "chat_reply" && args.text) out.reply = String(args.text);
+    } catch {}
+  }
+  return out;
+}
+
+async function extractNotes(
+  text: string,
+  topics: Topic[],
+  fallback: Topic | undefined,
+  history: Turn[]
+): Promise<{ notes: Note[]; reply: string; used: string; primary: boolean }> {
+  const providers = getProviders();
+  if (!providers.length) throw new Error("Нет ни одного ключа: задай GEMINI_API_KEY или LLM2_*");
+
+  const system = buildSystemPrompt(topics, fallback);
+  const noteDecl = {
+    ...NOTE_DECLARATION,
+    parameters: {
+      ...NOTE_DECLARATION.parameters,
+      properties: { ...NOTE_DECLARATION.parameters.properties, topic: { type: "string", enum: topics.map((t) => t.label) } },
+    },
+  };
+  const decls = topics.length ? [noteDecl, CHAT_DECLARATION] : [CHAT_DECLARATION];
+  const turns = buildTurns(history, text);
+
+  // Сначала те, кто не в «отпуске» после недавней ошибки, потом, на крайний случай, остальные
+  const cooling = await Promise.all(providers.map(isCooling));
+  const ordered = [...providers.filter((_, i) => !cooling[i]), ...providers.filter((_, i) => cooling[i])];
+
+  const errors: string[] = [];
+  let answeredEmpty = false;
+  for (const p of ordered) {
+    try {
+      const res = p.kind === "gemini" ? await callGemini(p, turns, system, decls) : await callOpenAI(p, turns, system, decls);
+      if (res.notes.length || res.reply) return { ...res, used: p.name, primary: p === providers[0] };
+      answeredEmpty = true;
+      errors.push(`${p.name}: пустой ответ`);
+    } catch (e: any) {
+      const status = e instanceof ProviderError ? e.status : 0;
+      console.error(`Provider ${p.name} failed`, status, e?.message);
+      errors.push(`${p.name} ${status || "сеть/таймаут"}: ${String(e?.message ?? e).slice(0, 80)}`);
+      await coolDown(p, status);
+    }
+  }
+  if (answeredEmpty) return { notes: [], reply: "", used: "", primary: true };
+  throw new Error(`Все модели отвалились. ${errors.join(" | ")}`);
 }
 
 const safeEmoji = (e?: string) => (e && e.length <= 8 ? e : "📌");
@@ -615,7 +799,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       await setupCommands();
       await tg("sendMessage", {
         chat_id: chatId,
-        text: "Хай. Я мини.автор ✍️ Пиши че угодно, я запишу и раскидаю по топикам в группе. Меню снизу, жми",
+        text: "Хай. Я мини.автор ✍️ Пиши заметки, я раскидаю по топикам в группе. А если просто поболтать, отвечу и ничего не запишу. Меню снизу",
         reply_markup: {
           keyboard: [[{ text: MENU_BUTTON_TEXT }]],
           resize_keyboard: true,
@@ -676,29 +860,24 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     const group = await getGroup();
-    const topics = await loadTopics();
-
-    if (!group || !topics.length) {
-      await tg("sendMessage", {
-        chat_id: chatId,
-        text: "Я твои топики ещё не знаю. Зайди в каждый нужный топик группы и напиши там любое сообщение. Подробнее в меню",
-      });
-      return res.status(200).send("ok");
-    }
-
+    const topics = group ? await loadTopics() : [];
     const defId = await getDefault();
     const fallback = topics.find((t) => t.id === defId);
-    const notes = await extractNotes(text, topics, fallback);
+    const history = await loadHistory();
+    const { notes, reply } = await extractNotes(text, topics, fallback, history);
 
-    if (!notes.length) {
+    if (!notes.length && !reply) {
       await tg("sendMessage", { chat_id: chatId, text: "Ты че несешь, не понял. Напиши по-другому?" });
       return res.status(200).send("ok");
     }
 
+    // Просто разговор: отвечаем в личке, в топики ничего не пишем
+    if (reply) await tg("sendMessage", { chat_id: chatId, text: reply });
+
     const saved: string[] = [];
     for (const note of notes) {
       const target = topics.find((t) => t.label === note.topic) ?? fallback;
-      if (!target) {
+      if (!target || !group) {
         saved.push(`⚠️ «${note.title}»: не нашёл куда деть, ой`);
         continue;
       }
@@ -716,7 +895,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       );
     }
 
-    await tg("sendMessage", { chat_id: chatId, text: `Записал, всм норм\n${saved.join("\n")}` });
+    if (notes.length) {
+      await tg("sendMessage", { chat_id: chatId, text: `Записал, всм норм\n${saved.join("\n")}` });
+    }
+    await saveHistory(history, text, reply, notes);
   } catch (e) {
     console.error(e);
     // Всё равно отвечаем 200, иначе Telegram будет слать сообщение повторно
