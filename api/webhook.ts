@@ -33,6 +33,11 @@ const esc = (s: string) =>
 // Названия, которые считаются «общим» топиком на случай, когда тема не подошла никуда
 const DEFAULT_WORDS = ["заметк", "разное", "другое", "other", "notes", "inbox"];
 
+const MENU_BUTTON_TEXT = "📋 Менюшка";
+const MENU_BUTTON_TEXTS = ["📋 Менюшка", "📋 Меню"]; // старая кнопка тоже работает
+
+const GROUP_COMMANDS = ["/ids", "/desc", "/default", "/forget"];
+
 // ---------- Telegram ----------
 
 async function tg(method: string, payload: Record<string, unknown>) {
@@ -101,13 +106,14 @@ async function getDefault(): Promise<number | null> {
 // Запоминает топик. Если название похоже на «Заметки» и запасного топика ещё нет, делает его запасным.
 async function registerTopic(thread: number, name: string) {
   const known = await redis(["HGET", "tg:topics", String(thread)]);
-  if (known !== name) await redis(["HSET", "tg:topics", String(thread), name]);
+  const isNew = known !== name;
+  if (isNew) await redis(["HSET", "tg:topics", String(thread), name]);
   let madeDefault = false;
   if (DEFAULT_WORDS.some((w) => name.toLowerCase().includes(w)) && !(await getDefault())) {
     await redis(["SET", "tg:default", String(thread)]);
     madeDefault = true;
   }
-  return { madeDefault };
+  return { madeDefault, isNew };
 }
 
 // ---------- Gemini ----------
@@ -130,10 +136,12 @@ ${fallback ? `- Если ничего не подходит, выбери «${fa
 Правила оформления:
 - title: коротко, до 60 символов, без эмодзи.
 - emoji: один эмодзи, подходящий по смыслу заметки.
-- body: чистый русский текст, без воды, можно списки через «•». Ничего не выдумывай: если данных нет, не добавляй их. Не меняй смысл, не добавляй советов.
+- body: коротко, без воды, можно списки через «•». Ничего не выдумывай: если данных нет, не добавляй их. Не меняй смысл, не добавляй советов.
+
+Стиль (это важно): ты маленький неряшливый дурачок-секретарь. Пиши title и body дурашливо, по-детски, с лёгкими шутками и парой настоящих глупых ошибок на заметку (например «щас», «чё», «каторый», «ихний», «пажалуста», «нипанятно», «тапик»). Ошибок немного, 1-3 на заметку, текст должен читаться легко. Эмодзи в тексте можно, но чуть-чуть.
+Но там, где важна точность, никаких ошибок и шуток над написанием: имена людей, суммы, даты, названия фильмов, сериалов, игр и треков, ссылки, номера, теги и значения полей who, amount, deadline пиши абсолютно точно. Смысл заметки сохраняй полностью.
 - Если в заметке про деньги кто-то кому-то должен, заполни who, amount (с валютой, по умолчанию ₽) и direction: "owes_me" если должны мне, "i_owe" если должен я.
 - Если назван срок или дата (дело, напоминание, план), заполни deadline в формате ГГГГ-ММ-ДД, считая от сегодняшней даты.
-- Ссылки оставляй как есть в body.
 - Если в сообщении несколько независимых заметок, вызови save_note несколько раз.
 
 Сегодня: ${today} (часовой пояс Москва).`;
@@ -184,68 +192,288 @@ async function extractNotes(text: string, topics: Topic[], fallback: Topic | und
     .map((p) => p.functionCall.args as Note);
 }
 
+const safeEmoji = (e?: string) => (e && e.length <= 8 ? e : "📌");
+
+// Заметки в группе пишем дурашливо, но имена, суммы, даты и ссылки модель переносит точно (см. промпт)
 function formatNote(n: Note): string {
-  const emoji = n.emoji && n.emoji.length <= 8 ? n.emoji : "📌";
-  const lines: string[] = [`${emoji} <b>${esc(n.title)}</b>`, ""];
+  const lines: string[] = [`${safeEmoji(n.emoji)} <b>${esc(n.title)}</b>`, ""];
 
   if (n.who || n.amount) {
     const who = n.who ? esc(n.who) : "?";
     const amount = n.amount ? esc(n.amount) : "";
     lines.push(
       n.direction === "i_owe"
-        ? `Ты должен: <b>${who}</b>, ${amount}`
-        : `<b>${who}</b> должен тебе ${amount}`
+        ? `Ты должен (ой): <b>${who}</b>, ${amount}`
+        : `<b>${who}</b> должон тибе ${amount}`
     );
   }
 
   if (n.body) lines.push(esc(n.body));
-  if (n.deadline) lines.push("", `📅 До: ${esc(n.deadline)}`);
+  if (n.deadline) lines.push("", `📅 Успей до: ${esc(n.deadline)}`);
   if (n.tags?.length) {
     lines.push("", n.tags.map((t) => `#${esc(t.replace(/\s+/g, "_").replace(/^#/, ""))}`).join(" "));
   }
   return lines.join("\n");
 }
 
-// ---------- Статус для команды /topics ----------
+// ---------- Меню (кнопки) ----------
 
-async function statusText(): Promise<string> {
+type Button = { text: string; callback_data: string };
+type View = { text: string; kb: { inline_keyboard: Button[][] } };
+
+const btn = (text: string, data: string): Button => ({ text, callback_data: data });
+const backBtn = (data = "menu", text = "◀️ Назад"): Button => btn(text, data);
+
+async function mainView(): Promise<View> {
   const group = await getGroup();
   const topics = await loadTopics();
-  const def = await getDefault();
-  const lines: string[] = [];
+  const defId = await getDefault();
+  const def = topics.find((t) => t.id === defId);
 
-  lines.push(group ? `Группа подключена (${group})` : "Группа пока не определена. Напиши /ids в любом топике группы.");
-  lines.push("");
+  let text =
+    "<b>Менюшка</b> 🤪\n\n" +
+    `Групка: ${group ? "падключена ✅" : "не падключена, ой ⚠️"}\n` +
+    `Тапиков: ${topics.length}\n` +
+    `Запаснай тапик: ${def ? esc(def.name) : "нету"}`;
+  if (!REDIS_URL) {
+    text += "\n\n⚠️ Базы нету, я всё забываю как рыбка. Падключи Upstash Redis в Vercel (Storage).";
+  }
+  text += "\n\nЧтобы я записал заметку, просто пиши мне сообщение. Я панимаю (почти).";
 
+  return {
+    text,
+    kb: {
+      inline_keyboard: [
+        [btn("📂 Мои тапики", "topics")],
+        [btn("⭐ Запаснай тапик", "defmenu"), btn("➕ Добавить тапик", "add")],
+        [btn("❓ Памагите", "help")],
+      ],
+    },
+  };
+}
+
+async function topicsView(): Promise<View> {
+  const topics = await loadTopics();
+  const defId = await getDefault();
   if (!topics.length) {
-    lines.push("Топиков пока нет. Зайди в каждый нужный топик группы и напиши там /ids.");
-  } else {
-    lines.push(`Топиков известно: ${topics.length}`);
-    for (const t of topics) {
-      lines.push(`• ${t.name}${t.id === def ? " (запасной)" : ""}${t.desc ? `: ${t.desc}` : ""}`);
+    return {
+      text:
+        "Тапиков пока нету 😢\n\n" +
+        "Зайди в нужнай тапик в группе и напиши там любое сообщение (или /ids). Я запомню, чесна-чесна. Один раз на тапик.",
+      kb: { inline_keyboard: [[backBtn("menu", "◀️ В менюшку")]] },
+    };
+  }
+  const rows: Button[][] = topics.map((t) => [btn(`${t.id === defId ? "⭐ " : ""}${t.name}`, `t:${t.id}`)]);
+  rows.push([backBtn("menu", "◀️ В менюшку")]);
+  return {
+    text: `<b>Мои тапики</b> (${topics.length})\n\nТыкни на тапик, будем его настраивать, хихи.`,
+    kb: { inline_keyboard: rows },
+  };
+}
+
+async function topicView(id: number): Promise<View> {
+  const topics = await loadTopics();
+  const t = topics.find((x) => x.id === id);
+  if (!t) return topicsView();
+  const defId = await getDefault();
+  const isDef = t.id === defId;
+
+  const rows: Button[][] = [];
+  rows.push([btn("✏️ Падсказка для меня", `d:${id}`), ...(t.desc ? [btn("🧹 Убрать", `dc:${id}`)] : [])]);
+  if (!isDef) rows.push([btn("⭐ Сделать запасным", `s:${id}`)]);
+  rows.push([btn("🧪 Праверить связь", `x:${id}`), btn("🗑 Забыть", `f:${id}`)]);
+  rows.push([backBtn("topics", "◀️ К тапикам")]);
+
+  return {
+    text:
+      `<b>${esc(t.name)}</b>${isDef ? " ⭐ запаснай" : ""}\n\n` +
+      `Падсказка для меня: ${t.desc ? esc(t.desc) : "нету"}\n\n` +
+      "Падсказка помогает мне панять, чё сюда класть. А то я путаю, я маленький.",
+    kb: { inline_keyboard: rows },
+  };
+}
+
+async function defView(): Promise<View> {
+  const topics = await loadTopics();
+  const defId = await getDefault();
+  const rows: Button[][] = topics.map((t) => [btn(`${t.id === defId ? "✅ " : ""}${t.name}`, `s:${t.id}`)]);
+  rows.push([backBtn("menu", "◀️ В менюшку")]);
+  return {
+    text: "<b>Запаснай тапик</b>\n\nСюда я кидаю всё, чё не смог панять куда деть. Выбири тапик:",
+    kb: { inline_keyboard: rows },
+  };
+}
+
+const addView = (): View => ({
+  text:
+    "<b>Как добавить тапик</b>\n\n" +
+    "1. Зайди в нужнай тапик в группе.\n" +
+    "2. Напиши там любое сообщение (или /ids).\n" +
+    "3. Я поставлю 🤪 и запомню.\n\n" +
+    "Новые тапики, каторые ты создашь потом, я замечу сам. Старые надо показать один раз: я их не вижу, у меня лапки.",
+  kb: { inline_keyboard: [[backBtn("menu", "◀️ В менюшку")]] },
+});
+
+const helpView = (): View => ({
+  text:
+    "<b>Памагите, как этим пользоваться</b>\n\n" +
+    "Пиши мне в личку чё угодна: идеи, долги, фильмы, дела, ссылки. Я сам выберу тапик в группе и оформлю заметку (ну я старааюсь).\n\n" +
+    "Если я кладу заметки не туда, зайди в «Мои тапики», выбири тапик и задай «Падсказку для меня»: коротко, чё сюда класть.\n\n" +
+    "В группе (в нужном тапике) работают команды:\n" +
+    "/ids: запомнить тапик\n" +
+    "/desc текст: падсказка для тапика\n" +
+    "/default: сделать тапик запасным\n" +
+    "/forget: забыть тапик",
+  kb: { inline_keyboard: [[backBtn("menu", "◀️ В менюшку")]] },
+});
+
+async function sendView(chatId: number | string, v: View) {
+  return tg("sendMessage", { chat_id: chatId, text: v.text, parse_mode: "HTML", reply_markup: v.kb });
+}
+
+async function setupCommands() {
+  await tg("setMyCommands", {
+    commands: [
+      { command: "menu", description: "Открыть менюшку" },
+      { command: "topics", description: "Мои тапики" },
+      { command: "help", description: "Памагите" },
+    ],
+    scope: { type: "all_private_chats" },
+  });
+  await tg("setMyCommands", {
+    commands: [
+      { command: "ids", description: "Запомнить этот тапик" },
+      { command: "desc", description: "Падсказка: чё сюда класть" },
+      { command: "default", description: "Сделать запасным тапиком" },
+      { command: "forget", description: "Забыть этот тапик" },
+    ],
+    scope: { type: "all_group_chats" },
+  });
+  await tg("setChatMenuButton", { menu_button: { type: "commands" } });
+}
+
+async function handleCallback(cb: any) {
+  const ack = (text?: string) =>
+    tg("answerCallbackQuery", { callback_query_id: cb.id, ...(text ? { text } : {}) });
+
+  if (String(cb.from?.id) !== String(OWNER_ID)) {
+    await ack();
+    return;
+  }
+  const chatId = cb.message?.chat?.id;
+  const mid = cb.message?.message_id;
+  if (!chatId || !mid) {
+    await ack();
+    return;
+  }
+
+  const [action, idStr] = String(cb.data ?? "").split(":");
+  const id = Number(idStr);
+  const show = (v: View) =>
+    tg("editMessageText", {
+      chat_id: chatId,
+      message_id: mid,
+      text: v.text,
+      parse_mode: "HTML",
+      reply_markup: v.kb,
+    });
+
+  let toast: string | undefined;
+
+  switch (action) {
+    case "menu":
+      await show(await mainView());
+      break;
+    case "topics":
+      await show(await topicsView());
+      break;
+    case "t":
+      await show(await topicView(id));
+      break;
+    case "defmenu":
+      await show(await defView());
+      break;
+    case "add":
+      await show(addView());
+      break;
+    case "help":
+      await show(helpView());
+      break;
+    case "d": {
+      // Ждём следующее сообщение владельца как подсказку для этого топика
+      const topics = await loadTopics();
+      const t = topics.find((x) => x.id === id);
+      if (!t) {
+        await show(await topicsView());
+        break;
+      }
+      await redis(["SET", "tg:state", JSON.stringify({ action: "desc", thread: id }), "EX", 600]);
+      await show({
+        text:
+          `Напиши одним сообщением, чё класть в «${esc(t.name)}».\n\n` +
+          "Например: фильмы и сериалы, каторые хочу пасматреть.",
+        kb: { inline_keyboard: [[btn("Отмена", `cancel:${id}`)]] },
+      });
+      break;
+    }
+    case "cancel":
+      await redis(["DEL", "tg:state"]);
+      await show(await topicView(id));
+      break;
+    case "dc":
+      await redis(["HDEL", "tg:desc", String(id)]);
+      toast = "Падсказку убрал";
+      await show(await topicView(id));
+      break;
+    case "s":
+      await redis(["SET", "tg:default", String(id)]);
+      toast = "Запаснай тапик теперь другой";
+      await show(await topicView(id));
+      break;
+    case "x": {
+      const group = await getGroup();
+      if (!group) {
+        toast = "Групки нету, ой";
+        break;
+      }
+      const r = await tg("sendMessage", {
+        chat_id: group,
+        message_thread_id: id,
+        text: "🧪 Праверка связи: я тут, я вижу тапик, ура!",
+      });
+      toast = r.ok ? "Кинул праверочку в тапик" : `Не палучилась: ${r.description ?? "ошипка"}`;
+      break;
+    }
+    case "f": {
+      const topics = await loadTopics();
+      const t = topics.find((x) => x.id === id);
+      if (!t) {
+        await show(await topicsView());
+        break;
+      }
+      await show({
+        text:
+          `Забыть тапик «${esc(t.name)}»?\n\n` +
+          "Я перестану туда писать. Сам тапик в группе не удалится, а вернуть можно командой /ids.",
+        kb: { inline_keyboard: [[btn("Да, забыть", `ff:${id}`), btn("Нет", `t:${id}`)]] },
+      });
+      break;
+    }
+    case "ff": {
+      await redis(["HDEL", "tg:topics", String(id)]);
+      await redis(["HDEL", "tg:desc", String(id)]);
+      const def = await getDefault();
+      if (def === id) await redis(["DEL", "tg:default"]);
+      toast = "Забыл, ага";
+      await show(await topicsView());
+      break;
     }
   }
 
-  if (topics.length && !def) {
-    lines.push("", "Запасной топик (куда класть то, что никуда не подошло) не задан. Зайди в нужный топик и напиши /default.");
-  }
-  if (!REDIS_URL) {
-    lines.push("", "⚠️ База не подключена: бот не запоминает топики. Подключи Upstash Redis в Vercel (Storage).");
-  }
-  return lines.join("\n");
+  await ack(toast);
 }
 
 // ---------- Основной обработчик ----------
-
-const HELP =
-  "Пиши мне что угодно: идеи, долги, фильмы, дела, ссылки. Я сам выберу топик в группе и красиво оформлю.\n\n" +
-  "В личке:\n" +
-  "/topics: какие топики я знаю\n\n" +
-  "В группе (в нужном топике, только ты):\n" +
-  "/ids: запомнить этот топик\n" +
-  "/desc текст: подсказать мне, что сюда класть (например «фильмы и сериалы, которые хочу посмотреть»)\n" +
-  "/default: сделать этот топик запасным\n" +
-  "/forget: забыть этот топик";
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST") return res.status(200).send("ok");
@@ -256,6 +484,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
+    // ===== Нажатия на кнопки меню =====
+    if (req.body?.callback_query) {
+      await handleCallback(req.body.callback_query);
+      return res.status(200).send("ok");
+    }
+
     const msg = req.body?.message;
     if (!msg) return res.status(200).send("ok");
 
@@ -283,45 +517,58 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         msg.forum_topic_edited?.name ??
         msg.reply_to_message?.forum_topic_created?.name;
 
+      // Любое сообщение владельца в топике запоминает этот топик (команда /ids не обязательна)
       let madeDefault = false;
+      let isNew = false;
       if (REDIS_URL && threadId && topicName && (service || fromOwner)) {
-        madeDefault = (await registerTopic(threadId, topicName)).madeDefault;
+        const r = await registerTopic(threadId, topicName);
+        madeDefault = r.madeDefault;
+        isNew = r.isNew;
+      }
+
+      // Тихо подтверждаем реакцией, что запомнил новый топик
+      if (isNew && !service && !GROUP_COMMANDS.includes(cmd) && msg.message_id) {
+        await tg("setMessageReaction", {
+          chat_id: chatId,
+          message_id: msg.message_id,
+          reaction: [{ type: "emoji", emoji: "🤪" }],
+        });
       }
 
       const say = (t: string) =>
         tg("sendMessage", { chat_id: chatId, message_thread_id: threadId, text: t });
 
-      if (fromOwner && ["/ids", "/desc", "/default", "/forget"].includes(cmd)) {
+      if (fromOwner && GROUP_COMMANDS.includes(cmd)) {
         if (!REDIS_URL) {
-          await say("База не подключена. Подключи Upstash Redis в Vercel (Storage) и сделай Redeploy.");
+          await say("Базы нету, я ничего не запомню 😭 Падключи Upstash Redis в Vercel (Storage) и сделай Redeploy.");
         } else if (!threadId) {
-          await say("Это общий топик (General), его я не запоминаю. Команды работают в обычных топиках.");
+          await say("Это общий тапик (General), его я не запоминаю, он скучнай. Команды работают в обычных тапиках.");
         } else if (cmd === "/ids") {
           if (!topicName) {
-            await say(`Не вижу название этого топика (thread_id ${threadId}). Попробуй переименовать топик и снова написать /ids.`);
+            await say(`Не вижу как тапик называется (thread_id ${threadId}). Переименуй тапик и напиши /ids ищё раз, пажалуста.`);
           } else {
             await say(
-              `Запомнил «${topicName}». Теперь могу складывать сюда заметки.` +
-                (madeDefault ? "\nЭтот топик стал запасным: сюда пойдёт то, что никуда не подошло." : "")
+              `Запомнил «${topicName}»! Теперь могу кидать сюда заметки 🤪` +
+                (madeDefault ? "\nЭтот тапик стал запаснай: сюда пойдёт всё, чё некуда деть." : "")
             );
           }
         } else if (cmd === "/desc") {
           if (!arg) {
-            await say("Напиши так: /desc что сюда класть. Например: /desc фильмы и сериалы, которые хочу посмотреть");
+            await say("Напиши так: /desc чё сюда класть. Например: /desc фильмы и сериалы, каторые хочу пасматреть");
           } else {
             if (topicName) await redis(["HSET", "tg:topics", String(threadId), topicName]);
             await redis(["HSET", "tg:desc", String(threadId), arg.slice(0, 300)]);
-            await say("Записал подсказку для этого топика.");
+            await say("Записал падсказку для этого тапика.");
           }
         } else if (cmd === "/default") {
           await redis(["SET", "tg:default", String(threadId)]);
-          await say("Теперь это запасной топик: сюда пойдёт то, что никуда не подошло.");
+          await say("Теперь это запаснай тапик: сюда пойдёт всё, чё некуда деть.");
         } else if (cmd === "/forget") {
           await redis(["HDEL", "tg:topics", String(threadId)]);
           await redis(["HDEL", "tg:desc", String(threadId)]);
           const def = await redis(["GET", "tg:default"]);
           if (def && Number(def) === threadId) await redis(["DEL", "tg:default"]);
-          await say("Забыл этот топик. Чтобы вернуть, напиши /ids.");
+          await say("Забыл этот тапик. Штобы вернуть, напиши /ids.");
         }
       }
       return res.status(200).send("ok");
@@ -330,18 +577,62 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // ===== Личка: только владелец =====
     if (!fromOwner) return res.status(200).send("ok");
 
-    if (cmd === "/start" || cmd === "/help") {
-      await tg("sendMessage", { chat_id: chatId, text: HELP });
+    if (cmd === "/start") {
+      await setupCommands();
+      await tg("sendMessage", {
+        chat_id: chatId,
+        text: "Прювет! Я бот-дурачок 🤪 Пиши мне чё угодна, а я раскидаю всё по тапикам в твоей группе (ну, я стараюсь). Менюшка всегда внизу, жми кнопку!",
+        reply_markup: {
+          keyboard: [[{ text: MENU_BUTTON_TEXT }]],
+          resize_keyboard: true,
+          is_persistent: true,
+        },
+      });
+      await sendView(chatId, await mainView());
+      return res.status(200).send("ok");
+    }
+
+    if (cmd === "/menu" || MENU_BUTTON_TEXTS.includes(text.trim())) {
+      await redis(["DEL", "tg:state"]);
+      await sendView(chatId, await mainView());
       return res.status(200).send("ok");
     }
 
     if (cmd === "/topics") {
-      await tg("sendMessage", { chat_id: chatId, text: await statusText() });
+      await sendView(chatId, await topicsView());
       return res.status(200).send("ok");
     }
 
+    if (cmd === "/help") {
+      await sendView(chatId, helpView());
+      return res.status(200).send("ok");
+    }
+
+    if (cmd === "/cancel") {
+      await redis(["DEL", "tg:state"]);
+      await tg("sendMessage", { chat_id: chatId, text: "Ладна, атменил." });
+      return res.status(200).send("ok");
+    }
+
+    // Если ждём подсказку для топика, это сообщение и есть подсказка
+    if (text.trim() && !text.startsWith("/")) {
+      const raw = await redis(["GET", "tg:state"]);
+      if (raw) {
+        let state: any = null;
+        try {
+          state = JSON.parse(String(raw));
+        } catch {}
+        if (state?.action === "desc" && state.thread) {
+          await redis(["HSET", "tg:desc", String(state.thread), text.trim().slice(0, 300)]);
+          await redis(["DEL", "tg:state"]);
+          await sendView(chatId, await topicView(Number(state.thread)));
+          return res.status(200).send("ok");
+        }
+      }
+    }
+
     if (!text.trim()) {
-      await tg("sendMessage", { chat_id: chatId, text: "Пока понимаю только текст (и подписи к фото)." });
+      await tg("sendMessage", { chat_id: chatId, text: "Я пока панимаю только текст (и падписи к фоткам), у меня лапки." });
       return res.status(200).send("ok");
     }
 
@@ -351,7 +642,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (!group || !topics.length) {
       await tg("sendMessage", {
         chat_id: chatId,
-        text: "Я ещё не знаю твои топики. Зайди в каждый нужный топик группы и напиши там /ids, потом проверь командой /topics.",
+        text: "Я ищё не знаю твои тапики 😅 Зайди в каждый нужнай тапик группы и напиши там любое сообщение. Падробнее: кнопка «Менюшка».",
       });
       return res.status(200).send("ok");
     }
@@ -361,7 +652,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const notes = await extractNotes(text, topics, fallback);
 
     if (!notes.length) {
-      await tg("sendMessage", { chat_id: chatId, text: "Не смог разобрать, попробуй переформулировать." });
+      await tg("sendMessage", { chat_id: chatId, text: "Нипанятна, чё ты хочешь 🥴 Напиши по-другому?" });
       return res.status(200).send("ok");
     }
 
@@ -369,7 +660,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     for (const note of notes) {
       const target = topics.find((t) => t.label === note.topic) ?? fallback;
       if (!target) {
-        saved.push(`⚠️ «${note.title}»: не нашёл подходящий топик`);
+        saved.push(`⚠️ «${note.title}»: не нашёл куда деть, ой`);
         continue;
       }
       const r = await tg("sendMessage", {
@@ -381,18 +672,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
       saved.push(
         r.ok
-          ? `${note.emoji && note.emoji.length <= 8 ? note.emoji : "📌"} ${target.name}: ${note.title}`
-          : `⚠️ ${target.name}: не отправилось (${r.description ?? "ошибка"})`
+          ? `${safeEmoji(note.emoji)} ${target.name}: ${note.title}`
+          : `⚠️ ${target.name}: не отправилось (${r.description ?? "ошипка"})`
       );
     }
 
-    await tg("sendMessage", { chat_id: chatId, text: `Записал:\n${saved.join("\n")}` });
+    await tg("sendMessage", { chat_id: chatId, text: `Записал, наверна всё правильна 🤪\n${saved.join("\n")}` });
   } catch (e) {
     console.error(e);
     // Всё равно отвечаем 200, иначе Telegram будет слать сообщение повторно
     const chatId = req.body?.message?.chat?.id;
     const isPrivate = req.body?.message?.chat?.type === "private";
-    if (chatId && isPrivate) await tg("sendMessage", { chat_id: chatId, text: "Что-то сломалось, глянь логи в Vercel." });
+    if (chatId && isPrivate) await tg("sendMessage", { chat_id: chatId, text: "Ой, чёта сломалось 💥 Глянь логи в Vercel." });
   }
 
   return res.status(200).send("ok");
