@@ -136,6 +136,7 @@ async function notifyOwner(text: string, dedupeKey?: string) {
 // d:{chat}     HASH   thread_id -> подсказка
 // def:{chat}   STRING thread_id запасного топика
 // h:{uid}      STRING последние реплики диалога (сутки)
+// chatlog:{uid} ZSET   последние 200 личных реплик за 30 дней, только для просмотра владельцем
 // st:{uid}     STRING ожидаемое действие (ввод подсказки)
 // rl:{uid}:{день}     счётчик сообщений к нейросети
 // users, banned       SET
@@ -170,6 +171,27 @@ async function redisPipe(cmds: Cmd[]): Promise<any[]> {
     if (x?.error) console.error("Redis error", x.error);
     return x?.result ?? null;
   });
+}
+
+type PrivateLogEntry = { ts: number; r: "u" | "b"; t: string; nonce: string };
+let privateLogSeq = 0;
+async function appendPrivateLog(uid: string, role: "u" | "b", value: string) {
+  const text = value.trim().slice(0, 1200);
+  if (!text) return;
+  const now = Date.now();
+  const key = `chatlog:${uid}`;
+  const entry: PrivateLogEntry = { ts: now, r: role, t: text, nonce: Math.random().toString(36).slice(2) };
+  try {
+    const [, , , count] = await redisPipe([
+      ["ZADD", key, now * 1000 + (privateLogSeq++ % 1000), JSON.stringify(entry)],
+      ["ZREMRANGEBYSCORE", key, "-inf", (now - 30 * 86400000) * 1000],
+      ["EXPIRE", key, 30 * 86400],
+      ["ZCARD", key],
+    ]);
+    if (Number(count) > 200) await redis(["ZREMRANGEBYRANK", key, 0, Number(count) - 201]);
+  } catch (e: any) {
+    console.error("appendPrivateLog", e?.message);
+  }
 }
 
 function toObj(r: any): Record<string, string> {
@@ -239,6 +261,8 @@ async function wipeUser(user: User) {
     ["DEL", `u:${user.id}`],
     ["DEL", `st:${user.id}`],
     ["DEL", `h:${user.id}`],
+    ["DEL", `chatlog:${user.id}`],
+    ["DEL", `chatlog:notice:${user.id}`],
     ["DEL", `note:${user.id}`],
     ["DEL", `notes:${user.id}`],
     ["DEL", `group:memory:private:${user.id}`],
@@ -391,7 +415,10 @@ async function runReminders(): Promise<number> {
             ? pickOne([`Сегодня «${t}»\nща вспомнил или ты в курсе?`, `Эй сегодня «${t}»\nне проеби`, `«${t}» сегодня\nпиздец как быстро время летит`])
             : `Бля я проспал, было «${t}» (${it.d})\nнадеюсь ты не забыл`;
       const r = await tg("sendMessage", { chat_id: it.u, text });
-      if (r.ok) sent++;
+      if (r.ok) {
+        sent++;
+        await appendPrivateLog(it.u, "b", text);
+      }
     }
     if (kind !== "tomorrow") await redis(["ZREM", "rem", raw]);
   }
@@ -451,24 +478,30 @@ async function sendOutreach(uid: string, interval: number): Promise<boolean> {
   let kind = pickOne(choices);
   let sent = false;
   let blocked = false;
+  let outgoingText = "";
   if (kind === "meme") {
     const meme = await pickMeme(uid);
-    if (meme) sent = await sendMeme(uid, meme, undefined, pickOne(["Смотри че нашёл", "Это ты хахаха", "Без контекста", "Мне кажется тебе надо это видеть", "Я просто оставлю это тут"]));
+    const caption = pickOne(["Смотри че нашёл", "Это ты хахаха", "Без контекста", "Мне кажется тебе надо это видеть", "Я просто оставлю это тут"]);
+    if (meme) sent = await sendMeme(uid, meme, undefined, caption);
+    if (sent) outgoingText = `[мем] ${caption}`;
     if (!sent) kind = "text";
   }
   if (kind === "track" && tracks.length) {
     const previous = await redis(["GET", `outreach:lasttrack:${uid}`]);
     const track = pickOne(tracks.filter((link) => link !== previous).length ? tracks.filter((link) => link !== previous) : tracks);
-    const r = await tg("sendMessage", { chat_id: uid, text: `${pickOne(["Послушай", "Мне нравится оч", "Зацени", "Ахуенно"])}\n${track}`, disable_web_page_preview: true });
+    outgoingText = `${pickOne(["Послушай", "Мне нравится оч", "Зацени", "Ахуенно"])}\n${track}`;
+    const r = await tg("sendMessage", { chat_id: uid, text: outgoingText, disable_web_page_preview: true });
     sent = Boolean(r.ok);
     blocked = Number(r.error_code) === 403;
     if (sent) await redis(["SET", `outreach:lasttrack:${uid}`, track, "EX", 2592000]);
   } else if (kind === "text") {
-    const r = await tg("sendMessage", { chat_id: uid, text: pickOne(OUTREACH_TEXTS) });
+    outgoingText = pickOne(OUTREACH_TEXTS);
+    const r = await tg("sendMessage", { chat_id: uid, text: outgoingText });
     sent = Boolean(r.ok);
     blocked = Number(r.error_code) === 403;
   }
   if (sent) {
+    await appendPrivateLog(uid, "b", outgoingText);
     const days = Math.max(2, interval + pickOne([-1, 0, 1]));
     await redisPipe([
       ["ZADD", "outreach:due", Date.now() + days * 86400000, uid],
@@ -1428,7 +1461,7 @@ async function systemView(): Promise<View> {
       `\nRedis Upstash: ${redisStatus === "PONG" ? "доступен" : "нет ответа"}` +
       `\n\nПодключения: Telegram Bot API ${configured("TELEGRAM_BOT_TOKEN")}, Gemini ${configured("GEMINI_API_KEY")}, резервные нейросети ${providers.filter((p) => p.kind === "openai").length}, Redis ${REDIS_URL && REDIS_TOKEN ? "✓" : "нет"}` +
       `\nСекрет вебхука: ${configured("WEBHOOK_SECRET")}, секрет cron: ${configured("CRON_SECRET")}` +
-      `\n\nПакеты проекта: @vercel/node ^5.0.0, TypeScript ^5.6.0; HTTP-запросы через встроенный fetch Node.js.\nХранение: настройки, счётчики, ID файлов и сообщений — в Upstash Redis; сами фото и заметки — в Telegram. Проверка напоминаний: 09:00 МСК ежедневно. Vercel и провайдеры не отдают этому боту баланс, квоты и деньги — их смотри в личных кабинетах.`,
+      `\n\nПакеты проекта: @vercel/node ^5.0.0, TypeScript ^5.6.0; HTTP-запросы через встроенный fetch Node.js.\nХранение: настройки, счётчики, ID файлов и сообщений, до 200 личных реплик на пользователя — в Upstash Redis; сами фото и заметки — в Telegram. Проверка напоминаний: 09:00 МСК ежедневно. Vercel и провайдеры не отдают этому боту баланс, квоты и деньги — их смотри в личных кабинетах.`,
     kb: { inline_keyboard: [[btn("Лимиты бота", "lims"), btn("Нейросети", "llms")], [btn("Вебхук", "wh")], [backBtn("adm", "В админ-панель")]] },
   };
 }
@@ -1470,7 +1503,63 @@ async function userView(uid: string, page: number): Promise<View> {
   const [info, banned, used] = await redisPipe([["HGETALL", `activity:${uid}`], ["SISMEMBER", "banned", uid], ["GET", `rl:${uid}:${new Date().toISOString().slice(0, 10)}`]]);
   const a = toObj(info);
   const date = Number(a.last) ? new Date(Number(a.last)).toLocaleString("ru-RU", { timeZone: DEFAULT_TZ }) : "нет данных";
-  return { text: `<b>${a.username ? `@${esc(a.username)}` : esc(a.name || "Пользователь")}</b>\n\nИмя: ${esc(a.name || "неизвестно")}\nUsername: ${a.username ? `@${esc(a.username)}` : "не указан"}\nTelegram ID: <code>${esc(uid)}</code>\nПоследняя активность: ${date}\nЛичных сообщений: ${a.private || 0}\nСообщений в группах, увиденных ботом: ${a.group || 0}\nЗапросов к нейросети сегодня: ${used || 0} / ${(await setting("daily")) || "∞"}\nСтатус: ${Number(banned) ? "заблокирован" : "активен"}`, kb: { inline_keyboard: [[btn(Number(banned) ? "Разблокировать" : "Заблокировать", `ub:${uid}:${page}`)], [backBtn(`users:${page}`, "К пользователям")]] } };
+  return { text: `<b>${a.username ? `@${esc(a.username)}` : esc(a.name || "Пользователь")}</b>\n\nИмя: ${esc(a.name || "неизвестно")}\nUsername: ${a.username ? `@${esc(a.username)}` : "не указан"}\nTelegram ID: <code>${esc(uid)}</code>\nПоследняя активность: ${date}\nЛичных сообщений: ${a.private || 0}\nСообщений в группах, увиденных ботом: ${a.group || 0}\nЗапросов к нейросети сегодня: ${used || 0} / ${(await setting("daily")) || "∞"}\nСтатус: ${Number(banned) ? "заблокирован" : "активен"}`, kb: { inline_keyboard: [[btn("💬 Переписка", `ul:${uid}:0:${page}`)], [btn(Number(banned) ? "Разблокировать" : "Заблокировать", `ub:${uid}:${page}`)], [backBtn(`users:${page}`, "К пользователям")]] } };
+}
+
+function escapedPreview(value: string, limit: number): string {
+  let out = "";
+  for (const char of value) {
+    const part = esc(char);
+    if (out.length + part.length > limit) return out + "…";
+    out += part;
+  }
+  return out;
+}
+
+function parsePrivateLog(raw: unknown): PrivateLogEntry | null {
+  try {
+    const item = JSON.parse(String(raw));
+    return item && (item.r === "u" || item.r === "b") && typeof item.t === "string" && Number.isFinite(item.ts) ? item as PrivateLogEntry : null;
+  } catch { return null; }
+}
+
+async function userLogView(uid: string, page: number, userPage: number): Promise<View> {
+  await redis(["ZREMRANGEBYSCORE", `chatlog:${uid}`, "-inf", (Date.now() - 30 * 86400000) * 1000]);
+  const [info, count] = await redisPipe([["HGETALL", `activity:${uid}`], ["ZCARD", `chatlog:${uid}`]]);
+  const a = toObj(info);
+  const total = Number(count) || 0;
+  const safePage = Math.min(Math.max(0, page), Math.max(0, Math.ceil(total / 6) - 1));
+  const offset = safePage * 6;
+  const raw: string[] = total ? ((await redis(["ZREVRANGE", `chatlog:${uid}`, offset, offset + 5])) ?? []).map(String) : [];
+  const entries = raw.map((value, i) => ({ entry: parsePrivateLog(value), index: offset + i })).filter((x): x is { entry: PrivateLogEntry; index: number } => Boolean(x.entry)).reverse();
+  const name = a.username ? `@${a.username}` : a.name || uid;
+  const lines = entries.map(({ entry, index }) => {
+    const time = new Date(entry.ts).toLocaleString("ru-RU", { timeZone: DEFAULT_TZ, day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+    const preview = escapedPreview(entry.t, 420);
+    return `<b>${entry.r === "u" ? esc(name) : "Миниавтор"}</b> · ${time}\n${preview}${preview.endsWith("…") ? `\n<i>Полный текст: кнопка ${index + 1}</i>` : ""}`;
+  });
+  if (!total) {
+    const old = await loadHistory(uid);
+    if (old.length) lines.push("<i>Журнал ещё пуст. Недавние реплики из старой краткой истории:</i>", ...old.slice(-6).map((turn) => `<b>${turn.r === "u" ? esc(name) : "Миниавтор"}:</b> ${escapedPreview(turn.t, 350)}`));
+  }
+  const rows: Button[][] = entries.filter(({ entry }) => escapedPreview(entry.t, 420).endsWith("…")).map(({ entry, index }) => [btn(`Полный текст ${index + 1}`, `um:${uid}:${index}:${entry.nonce}:${userPage}`)]);
+  const nav = [...(safePage > 0 ? [btn("← Новее", `ul:${uid}:${safePage - 1}:${userPage}`)] : []), ...(offset + 6 < total ? [btn("Старше →", `ul:${uid}:${safePage + 1}:${userPage}`)] : [])];
+  if (nav.length) rows.push(nav);
+  rows.push([backBtn(`usr:${uid}:${userPage}`, "К пользователю")]);
+  return { text: `<b>Переписка с ${esc(name)}</b>\nTelegram ID: <code>${esc(uid)}</code>\nСообщений в журнале: ${total}${total ? ` · страница ${safePage + 1}` : ""}\n\n${lines.length ? lines.join("\n\n") : "Пока нет записанных личных сообщений. Новые появятся после обновления бота."}`, kb: { inline_keyboard: rows } };
+}
+
+async function userLogMessageView(uid: string, index: number, nonce: string, userPage: number): Promise<View> {
+  await redis(["ZREMRANGEBYSCORE", `chatlog:${uid}`, "-inf", (Date.now() - 30 * 86400000) * 1000]);
+  const raw = await redis(["ZREVRANGE", `chatlog:${uid}`, index, index]);
+  const found = Array.isArray(raw) ? parsePrivateLog(raw[0]) : null;
+  const entry = found?.nonce === nonce ? found : null;
+  const info = toObj(await redis(["HGETALL", `activity:${uid}`]));
+  const name = info.username ? `@${info.username}` : info.name || uid;
+  const text = entry
+    ? `<b>${entry.r === "u" ? esc(name) : "Миниавтор"}</b> · ${new Date(entry.ts).toLocaleString("ru-RU", { timeZone: DEFAULT_TZ })}\n\n${escapedPreview(entry.t, 3500)}`
+    : "Сообщение уже удалено из журнала";
+  return { text, kb: { inline_keyboard: [[backBtn(`ul:${uid}:${Math.floor(index / 6)}:${userPage}`, "К переписке")]] } };
 }
 
 async function llmsView(): Promise<View> {
@@ -1609,7 +1698,7 @@ async function handleCallback(cb: any) {
   }
   let user = loaded.user;
 
-  const [action, arg1, arg2] = String(cb.data ?? "").split(":");
+  const [action, arg1, arg2, arg3, arg4] = String(cb.data ?? "").split(":");
   const id = Number(arg1);
   const show = (v: View) =>
     tg("editMessageText", {
@@ -1621,7 +1710,7 @@ async function handleCallback(cb: any) {
       reply_markup: v.kb,
     });
 
-  if (["adm", "as", "av", "wh", "whset", "grs", "gv", "gl", "gm", "gp", "lims", "llms", "users", "usr", "ub", "src", "memup", "sys"].includes(action) && !isOwner(uid)) {
+  if (["adm", "as", "av", "wh", "whset", "grs", "gv", "gl", "gm", "gp", "lims", "llms", "users", "usr", "ul", "um", "ub", "src", "memup", "sys"].includes(action) && !isOwner(uid)) {
     await ack();
     return;
   }
@@ -1677,6 +1766,12 @@ async function handleCallback(cb: any) {
       break;
     case "usr":
       if (/^\d+$/.test(arg1)) await show(await userView(arg1, Math.max(0, Number(arg2) || 0)));
+      break;
+    case "ul":
+      if (/^\d+$/.test(arg1) && Number(await redis(["SISMEMBER", "users", arg1]))) await show(await userLogView(arg1, Number(arg2) || 0, Number(arg3) || 0));
+      break;
+    case "um":
+      if (/^\d+$/.test(arg1) && Number(await redis(["SISMEMBER", "users", arg1]))) await show(await userLogMessageView(arg1, Math.max(0, Math.min(199, Number(arg2) || 0)), arg3 || "", Number(arg4) || 0));
       break;
     case "ub":
       if (/^\d+$/.test(arg1) && arg1 !== String(OWNER_ID)) {
@@ -2430,7 +2525,12 @@ async function handlePrivate(msg: any) {
   const uid = String(msg.from?.id ?? "");
   const chatId = msg.chat.id;
   if (!uid) return;
-  const send = (t: string) => tg("sendMessage", { chat_id: chatId, text: t });
+  let capture = false;
+  const send = async (t: string) => {
+    const result = await tg("sendMessage", { chat_id: chatId, text: t });
+    if (capture && result.ok) await appendPrivateLog(uid, "b", t);
+    return result;
+  };
 
   if (!REDIS_URL) {
     await send("Я пока не настроен, к проекту не подключена база. Напиши админу бота");
@@ -2445,13 +2545,26 @@ async function handlePrivate(msg: any) {
   const parts = text.trim().split(/\s+/);
   const cmd = (parts[0] ?? "").split("@")[0].toLowerCase();
   const arg = text.trim().slice((parts[0] ?? "").length).trim();
+  capture = !cmd.startsWith("/") && !MENU_BUTTON_TEXTS.includes(text.trim());
+  if (capture) {
+    if (!isOwner(uid)) {
+      const firstNotice = await redis(["SET", `chatlog:notice:${uid}`, "1", "NX"]);
+      if (firstNotice) {
+        const notice = await tg("sendMessage", { chat_id: chatId, text: "Кстати, владелец бота может читать наш личный чат в админ-панели. /deleteme удалит сохранённую историю." });
+        if (!notice.ok) await redis(["DEL", `chatlog:notice:${uid}`]);
+      }
+    }
+    const mediaLabel = msg.photo?.length ? "[фото] " : msg.animation ? "[GIF] " : msg.video ? "[видео] " : msg.voice ? "[голосовое] " : msg.video_note ? "[кружок] " : "";
+    await appendPrivateLog(uid, "u", `${mediaLabel}${text}`.trim() || "[вложение]");
+  }
 
   if (cmd === "/start") {
     await ensureCommands(isOwner(uid));
+    await redis(["SET", `chatlog:notice:${uid}`, "1"]);
     await tg("sendMessage", {
       chat_id: chatId,
       text:
-        "Хай. Я мини.автор\nТот самый оригинал, а Влад это просто моя версия хахаха. Я пизже, быстрее и никогда не пропадаю\nМожешь просто потрепаться со мной, я в этом ахуенный\n\nИ еще я так-то неплохой секретарь: могу раскидывать твои заметки по топикам твоей групки. Это по желанию, надо будет, подключишь в менюшке\n\nИнтересные фрагменты личных разговоров я иногда показываю владельцу бота. Раз в несколько дней могу написать первым или кинуть мем либо трек. /quiet отключит такие вбросы, /unquiet вернёт.",
+        "Хай. Я мини.автор\nТот самый оригинал, а Влад это просто моя версия хахаха. Я пизже, быстрее и никогда не пропадаю\nМожешь просто потрепаться со мной, я в этом ахуенный\n\nИ еще я так-то неплохой секретарь: могу раскидывать твои заметки по топикам твоей групки. Это по желанию, надо будет, подключишь в менюшке\n\nВладелец может читать нашу личную переписку в админ-панели, а интересные фрагменты я иногда ему присылаю. /deleteme удалит сохранённую историю. Раз в несколько дней могу написать первым или кинуть мем либо трек. /quiet отключит такие вбросы, /unquiet вернёт.",
       reply_markup: {
         keyboard: [[{ text: MENU_BUTTON_TEXT }]],
         resize_keyboard: true,
