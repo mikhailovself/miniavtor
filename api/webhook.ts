@@ -173,9 +173,9 @@ async function redisPipe(cmds: Cmd[]): Promise<any[]> {
   });
 }
 
-type PrivateLogEntry = { ts: number; r: "u" | "b"; t: string; nonce: string };
+type PrivateLogEntry = { ts: number; r: "u" | "b" | "o"; t: string; nonce: string };
 let privateLogSeq = 0;
-async function appendPrivateLog(uid: string, role: "u" | "b", value: string) {
+async function appendPrivateLog(uid: string, role: "u" | "b" | "o", value: string) {
   const text = value.trim().slice(0, 1200);
   if (!text) return;
   const now = Date.now();
@@ -263,6 +263,7 @@ async function wipeUser(user: User) {
     ["DEL", `h:${user.id}`],
     ["DEL", `chatlog:${user.id}`],
     ["DEL", `chatlog:notice:${user.id}`],
+    ["DEL", `live:user:${user.id}`],
     ["DEL", `note:${user.id}`],
     ["DEL", `notes:${user.id}`],
     ["DEL", `group:memory:private:${user.id}`],
@@ -289,6 +290,7 @@ async function wipeUser(user: User) {
     }
   });
   if (mine.length) await redis(["ZREM", "rem", ...mine]);
+  if (String(await redis(["GET", "live:owner"])) === user.id) await redis(["DEL", "live:owner"]);
   const bad: string[] = ((await redis(["ZRANGE", "badreply:samples", 0, -1])) ?? []).map(String);
   const badMine = bad.filter((raw) => {
     try { return String(JSON.parse(raw).uid) === user.id; } catch { return false; }
@@ -361,6 +363,131 @@ async function recordActivity(uid: string, from: any, kind: "private" | "group")
     }
   }
   await redisPipe(cmds);
+}
+
+const LIVE_SECONDS = 12 * 3600;
+
+function liveMessageText(msg: any): string {
+  const label = msg.photo?.length ? "[фото]" : msg.animation ? "[GIF]" : msg.video ? "[видео]" : msg.voice ? "[голосовое]" : msg.video_note ? "[кружок]" : msg.document ? "[файл]" : msg.sticker ? "[стикер]" : msg.audio ? "[аудио]" : msg.location ? "[геолокация]" : msg.contact ? "[контакт]" : msg.poll ? "[опрос]" : "";
+  return [label, String(msg.text ?? msg.caption ?? "")].filter(Boolean).join(" ").trim() || "[сообщение]";
+}
+
+async function appendLiveHistory(uid: string, role: "u" | "b", value: string) {
+  const history = await loadHistory(uid);
+  await redis(["SET", `h:${uid}`, JSON.stringify([...history, { r: role, t: value.slice(0, 500), kind: "chat" }].slice(-10)), "EX", 86400]);
+}
+
+async function stopLive(notify = true): Promise<string | null> {
+  const target = String((await redis(["GET", "live:owner"])) ?? "");
+  if (!target) return null;
+  await redisPipe([["DEL", "live:owner"], ["DEL", `live:user:${target}`]]);
+  if (notify) {
+    const text = "Влад ушёл, я снова тут. Чё хотел?";
+    const sent = await tg("sendMessage", { chat_id: target, text });
+    if (sent.ok) await appendPrivateLog(target, "b", text);
+  }
+  return target;
+}
+
+async function startLive(target: string): Promise<boolean> {
+  const previous = String((await redis(["GET", "live:owner"])) ?? "");
+  if (previous === target) {
+    await redisPipe([["EXPIRE", "live:owner", LIVE_SECONDS], ["EXPIRE", `live:user:${target}`, LIVE_SECONDS]]);
+    return true;
+  }
+  if (previous) await stopLive();
+  const notice = await tg("sendMessage", { chat_id: target, text: "Влад подключился к разговору и сейчас отвечает сам. Миниавтор пока помолчит. Через 12 часов тишины режим закончится сам." });
+  if (!notice.ok) return false;
+  const [ownerSet, userSet] = await redisPipe([["SET", "live:owner", target, "EX", LIVE_SECONDS], ["SET", `live:user:${target}`, "1", "EX", LIVE_SECONDS]]);
+  if (ownerSet !== "OK" || userSet !== "OK") {
+    await redisPipe([["DEL", "live:owner"], ["DEL", `live:user:${target}`]]);
+    await tg("sendMessage", { chat_id: target, text: "Не получилось подключить Влада, я пока отвечаю сам." });
+    return false;
+  }
+  await appendPrivateLog(target, "b", "[Влад подключился к разговору]");
+  return true;
+}
+
+async function relayToOwner(msg: any, uid: string): Promise<boolean> {
+  const name = [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ") || "Без имени";
+  const username = msg.from?.username ? ` @${msg.from.username}` : "";
+  const body = liveMessageText(msg);
+  const header = `💬 ${name}${username} (ID ${uid}):\n`;
+  const preview = body.length > 3500 ? `${body.slice(0, 3500)}…` : body;
+  const sent = await tg("sendMessage", { chat_id: OWNER_ID, text: header + preview });
+  if (!sent.ok) return false;
+  if (!msg.text || body.length > 3500) {
+    const copied = await tg("copyMessage", { chat_id: OWNER_ID, from_chat_id: uid, message_id: msg.message_id });
+    if (!copied.ok) await tg("sendMessage", { chat_id: OWNER_ID, text: `Не смог показать вложение от ${name} (ID ${uid}).` });
+  }
+  await Promise.allSettled([
+    redisPipe([["EXPIRE", "live:owner", LIVE_SECONDS], ["EXPIRE", `live:user:${uid}`, LIVE_SECONDS]]),
+    appendLiveHistory(uid, "u", body),
+  ]);
+  return true;
+}
+
+async function relayFromOwner(msg: any, target: string): Promise<boolean> {
+  const copied = await tg("copyMessage", { chat_id: target, from_chat_id: OWNER_ID, message_id: msg.message_id });
+  if (!copied.ok) return false;
+  const body = liveMessageText(msg);
+  await Promise.allSettled([
+    appendPrivateLog(target, "o", body),
+    appendLiveHistory(target, "b", body),
+    redisPipe([["EXPIRE", "live:owner", LIVE_SECONDS], ["EXPIRE", `live:user:${target}`, LIVE_SECONDS]]),
+    tg("setMessageReaction", { chat_id: OWNER_ID, message_id: msg.message_id, reaction: [{ type: "emoji", emoji: "👍" }] }),
+  ]);
+  return true;
+}
+
+// Рассылка хранит очередь в Redis: один запуск обрабатывает лишь короткую пачку.
+async function broadcastRecipients(): Promise<string[]> {
+  const ids: string[] = ((await redis(["SMEMBERS", "users"])) ?? []).map(String).filter((id: string) => /^\d+$/.test(id) && id !== String(OWNER_ID));
+  const recipients: string[] = [];
+  for (let i = 0; i < ids.length; i += 50) {
+    const batch = ids.slice(i, i + 50);
+    const rows = await redisPipe(batch.flatMap((id) => [["HGET", `activity:${id}`, "private"], ["SISMEMBER", "banned", id]]));
+    batch.forEach((id, n) => { if (Number(rows[n * 2]) > 0 && !Number(rows[n * 2 + 1])) recipients.push(id); });
+  }
+  return recipients;
+}
+
+async function runBroadcast(maxMs = 15000): Promise<void> {
+  const lock = await redis(["SET", "broadcast:lock", "1", "NX", "EX", 45]);
+  if (!lock) return;
+  const started = Date.now();
+  try {
+    const active = toObj(await redis(["HGETALL", "broadcast:active"]));
+    if (!active.id || active.status !== "sending") return;
+    while (Date.now() - started < maxMs) {
+      const uid = String((await redis(["LPOP", "broadcast:queue"])) ?? "");
+      if (!uid) break;
+      if (Number(await redis(["SISMEMBER", "banned", uid])) || !Number(await redis(["SISMEMBER", "users", uid]))) {
+        await redis(["HINCRBY", "broadcast:active", "skipped", 1]);
+        continue;
+      }
+      let result = await tg("copyMessage", { chat_id: uid, from_chat_id: OWNER_ID, message_id: Number(active.message_id) });
+      if (!result.ok && (Number(result.error_code) === 429 || Number(result.error_code) >= 500)) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        result = await tg("copyMessage", { chat_id: uid, from_chat_id: OWNER_ID, message_id: Number(active.message_id) });
+      }
+      if (!result.ok && (Number(result.error_code) === 429 || Number(result.error_code) >= 500)) {
+        await redis(["RPUSH", "broadcast:queue", uid]);
+        await redis(["HSET", "broadcast:active", "last_error", String(result.description ?? "Telegram временно недоступен").slice(0, 160)]);
+        break;
+      }
+      await redis(["HINCRBY", "broadcast:active", result.ok ? "sent" : "failed", 1]);
+      if (!result.ok) await redis(["HSET", "broadcast:active", "last_error", String(result.description ?? "Telegram").slice(0, 160)]);
+      await new Promise((resolve) => setTimeout(resolve, 45));
+    }
+    if (Number(await redis(["LLEN", "broadcast:queue"])) === 0) {
+      await redis(["HSET", "broadcast:active", "status", "done", "finished", String(Date.now())]);
+      const final = toObj(await redis(["HGETALL", "broadcast:active"]));
+      await tg("sendMessage", { chat_id: OWNER_ID, text: `Рассылка закончена: доставлено ${final.sent || 0}, ошибок ${final.failed || 0}, пропущено ${final.skipped || 0}.` });
+    }
+  } finally {
+    await redis(["DEL", "broadcast:lock"]);
+  }
 }
 
 // ---------- Напоминания о сроках ----------
@@ -491,17 +618,18 @@ async function seedOutreachRecipients() {
 }
 
 async function sendOutreach(uid: string, interval: number): Promise<boolean> {
-  const [banned, muted, lastPrivate, lastKind] = await redisPipe([
+  const [banned, muted, lastPrivate, lastKind, live] = await redisPipe([
     ["SISMEMBER", "banned", uid],
     ["SISMEMBER", "outreach:muted", uid],
     ["HGET", `activity:${uid}`, "last_private"],
     ["HGET", `outreach:lastkind`, uid],
+    ["EXISTS", `live:user:${uid}`],
   ]);
   if (Number(banned) || Number(muted)) {
     await redis(["ZREM", "outreach:due", uid]);
     return false;
   }
-  if (Number(lastPrivate) > Date.now() - 12 * 3600000) {
+  if (Number(live) || Number(lastPrivate) > Date.now() - 12 * 3600000) {
     await redis(["ZADD", "outreach:due", Date.now() + 86400000, uid]);
     return false;
   }
@@ -1370,9 +1498,11 @@ type View = { text: string; kb: { inline_keyboard: Button[][] } };
 const btn = (text: string, data: string): Button => ({ text, callback_data: data });
 const urlBtn = (text: string, url: string): Button => ({ text, url });
 const backBtn = (data = "menu", text = "Назад"): Button => btn(text, data);
+const profileUrl = (username: string | undefined) => username && /^[A-Za-z0-9_]{5,32}$/.test(username) ? `https://t.me/${username}` : null;
 
 async function mainView(user: User): Promise<View> {
   let text = "<b>Менюшка</b>\n\n";
+  const liveTarget = isOwner(user.id) ? String((await redis(["GET", "live:owner"])) ?? "") : "";
   if (user.group) {
     const g = await loadGroup(user.group);
     const def = g.topics.find((t) => t.id === g.def);
@@ -1384,7 +1514,10 @@ async function mainView(user: User): Promise<View> {
   } else {
     text += "Групка не падключена. Это по желанию: хочешь чтоб я раскидывал твои заметки по топикам, тыкни «Подключить группу»\n";
   }
-  text += "\nПросто пиши мне заметку а я запишу ща";
+  text += liveTarget
+    ? `\n⚠️ Ты сейчас лично отвечаешь пользователю ${esc(liveTarget)}. Любое обычное сообщение сюда уйдёт ему. /stoplive — выйти.`
+    : "\nПросто пиши мне заметку а я запишу ща";
+  text += "\n\nДобавь меня в обычную группу без тем — иногда сам пошучу, прокомментирую, кину мем или поставлю реакцию. Если позовёшь через @ или ответишь на моё сообщение, включусь чаще. Подробнее — «Памагите».";
 
   return {
     text,
@@ -1393,6 +1526,7 @@ async function mainView(user: User): Promise<View> {
         [btn("Мои топики", "topics")],
         [btn("Запасной топик", "defmenu"), btn(user.group ? "Моя групка" : "Подключить группу", "connect")],
         [btn("Памагите", "help"), btn("Автор", "author")],
+        ...(liveTarget ? [[btn("⏹ Выйти из ручного диалога", `ld:${liveTarget}:0`)]] : []),
         ...(isOwner(user.id) ? [[btn("⚙️ Админ-панель", "adm")]] : []),
       ],
     },
@@ -1508,6 +1642,7 @@ async function adminView(): Promise<View> {
       [btn("Система и подключения", "sys")],
       [btn("Напоминания и расписание", "cr")],
       [btn("Пользователи", "users:0")],
+      [btn("📣 Рассылка пользователям", "bview")],
       [btn("Ответы мимо", "bad:0")],
       [btn("Источник канала", "src")],
       [btn("Группы и активность", "grs")],
@@ -1515,6 +1650,19 @@ async function adminView(): Promise<View> {
       [backBtn("menu", "В меню")],
     ] },
   };
+}
+
+async function broadcastView(): Promise<View> {
+  const a = toObj(await redis(["HGETALL", "broadcast:active"]));
+  const pending = Number(await redis(["LLEN", "broadcast:queue"])) || 0;
+  if (a.id) {
+    const done = a.status === "done";
+    return {
+      text: `<b>📣 Рассылка</b>\n\n${done ? "Завершена" : "Идёт отправка"}. Всего: ${a.total || 0}; доставлено: ${a.sent || 0}; ошибок: ${a.failed || 0}; пропущено: ${a.skipped || 0}; осталось: ${pending}.${a.last_error ? `\nПоследняя ошибка: ${esc(a.last_error)}` : ""}\n\nСообщение отправляется только людям, которые уже писали боту в личку.`,
+      kb: { inline_keyboard: [...(!done ? [[btn("▶️ Продолжить сейчас", "brun"), btn("⏹ Остановить", "bstop")]] : [[btn("Новая рассылка", "bnew")]]), [backBtn("adm", "В админ-панель")]] },
+    };
+  }
+  return { text: "<b>📣 Рассылка</b>\n\nОтправлю одно твоё сообщение всем, кто уже писал боту в личку. Поддерживаются текст, фото, GIF, видео и другие сообщения Telegram. Сначала покажу превью и число получателей, затем попрошу подтвердить. Отправка идёт пачками, прогресс виден здесь.", kb: { inline_keyboard: [[btn("Написать сообщение", "bnew")], [backBtn("adm", "В админ-панель")]] } };
 }
 
 async function memeUploadView(): Promise<View> {
@@ -1583,18 +1731,26 @@ async function usersView(page: number): Promise<View> {
   const identities = shown.length ? await redisPipe(shown.map((uid) => ["HMGET", `activity:${uid}`, "username", "name"])) : [];
   const rows: Button[][] = shown.map((uid, i) => {
     const [username, name] = (identities[i] ?? []) as (string | null)[];
-    return [btn((username ? `@${username}` : name || uid).slice(0, 50), `usr:${uid}:${page}`)];
+    const url = profileUrl(username || undefined);
+    return url
+      ? [urlBtn(`@${username}`.slice(0, 45), url), btn("📊 Карточка", `usr:${uid}:${page}`)]
+      : [btn((name || uid).slice(0, 50), `usr:${uid}:${page}`)];
   });
   rows.push([...(page > 0 ? [btn("←", `users:${page - 1}`)] : []), ...(start + 10 < ids.length ? [btn("→", `users:${page + 1}`)] : [])]);
   rows.push([backBtn("adm", "В админ-панель")]);
-  return { text: `<b>Пользователи</b>\n\nВсего зарегистрировано: ${(all ?? []).length}\nСтраница ${page + 1}. Счётчики активности собираются после обновления.`, kb: { inline_keyboard: rows } };
+  return { text: `<b>Пользователи</b>\n\nВсего зарегистрировано: ${(all ?? []).length}\nСтраница ${page + 1}. @username открывает профиль Telegram, «Карточка» — статистику и переписку. Если username нет, имя открывает карточку. Счётчики активности собираются после обновления.`, kb: { inline_keyboard: rows } };
 }
 
 async function userView(uid: string, page: number): Promise<View> {
-  const [info, banned, used] = await redisPipe([["HGETALL", `activity:${uid}`], ["SISMEMBER", "banned", uid], ["GET", `rl:${uid}:${new Date().toISOString().slice(0, 10)}`]]);
+  const [info, banned, used, liveTarget] = await redisPipe([["HGETALL", `activity:${uid}`], ["SISMEMBER", "banned", uid], ["GET", `rl:${uid}:${new Date().toISOString().slice(0, 10)}`], ["GET", "live:owner"]]);
   const a = toObj(info);
   const date = Number(a.last) ? new Date(Number(a.last)).toLocaleString("ru-RU", { timeZone: DEFAULT_TZ }) : "нет данных";
-  return { text: `<b>${a.username ? `@${esc(a.username)}` : esc(a.name || "Пользователь")}</b>\n\nИмя: ${esc(a.name || "неизвестно")}\nUsername: ${a.username ? `@${esc(a.username)}` : "не указан"}\nTelegram ID: <code>${esc(uid)}</code>\nПоследняя активность: ${date}\nЛичных сообщений: ${a.private || 0}\nСообщений в группах, увиденных ботом: ${a.group || 0}\nЗапросов к нейросети сегодня: ${used || 0} / ${(await setting("daily")) || "∞"}\nСтатус: ${Number(banned) ? "заблокирован" : "активен"}`, kb: { inline_keyboard: [[btn("💬 Переписка", `ul:${uid}:0:${page}`)], [btn(Number(banned) ? "Разблокировать" : "Заблокировать", `ub:${uid}:${page}`)], [backBtn(`users:${page}`, "К пользователям")]] } };
+  const live = String(liveTarget ?? "") === uid;
+  const liveButton = uid !== String(OWNER_ID) && Number(a.private) > 0
+    ? [[btn(live ? "⏹ Выйти из диалога" : "✍️ Подключиться к диалогу", `${live ? "ld" : "lc"}:${uid}:${page}`)]]
+    : [];
+  const url = profileUrl(a.username);
+  return { text: `<b>${a.username ? `@${esc(a.username)}` : esc(a.name || "Пользователь")}</b>\n\nИмя: ${esc(a.name || "неизвестно")}\nUsername: ${a.username ? `@${esc(a.username)}` : "не указан"}\nTelegram ID: <code>${esc(uid)}</code>\nПоследняя активность: ${date}\nЛичных сообщений: ${a.private || 0}\nСообщений в группах, увиденных ботом: ${a.group || 0}\nЗапросов к нейросети сегодня: ${used || 0} / ${(await setting("daily")) || "∞"}\nСтатус: ${Number(banned) ? "заблокирован" : "активен"}\nРучной диалог: ${live ? "ты на связи, бот молчит" : "бот отвечает сам"}`, kb: { inline_keyboard: [...(url ? [[urlBtn("Открыть профиль Telegram", url)]] : []), [btn("💬 Переписка", `ul:${uid}:0:${page}`)], ...liveButton, [btn(Number(banned) ? "Разблокировать" : "Заблокировать", `ub:${uid}:${page}`)], [backBtn(`users:${page}`, "К пользователям")]] } };
 }
 
 function escapedPreview(value: string, limit: number): string {
@@ -1610,7 +1766,7 @@ function escapedPreview(value: string, limit: number): string {
 function parsePrivateLog(raw: unknown): PrivateLogEntry | null {
   try {
     const item = JSON.parse(String(raw));
-    return item && (item.r === "u" || item.r === "b") && typeof item.t === "string" && Number.isFinite(item.ts) ? item as PrivateLogEntry : null;
+    return item && (item.r === "u" || item.r === "b" || item.r === "o") && typeof item.t === "string" && Number.isFinite(item.ts) ? item as PrivateLogEntry : null;
   } catch { return null; }
 }
 
@@ -1627,7 +1783,7 @@ async function userLogView(uid: string, page: number, userPage: number): Promise
   const lines = entries.map(({ entry, index }) => {
     const time = new Date(entry.ts).toLocaleString("ru-RU", { timeZone: DEFAULT_TZ, day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
     const preview = escapedPreview(entry.t, 420);
-    return `<b>${entry.r === "u" ? esc(name) : "Миниавтор"}</b> · ${time}\n${preview}${preview.endsWith("…") ? `\n<i>Полный текст: кнопка ${index + 1}</i>` : ""}`;
+    return `<b>${entry.r === "u" ? esc(name) : entry.r === "o" ? "Владелец" : "Миниавтор"}</b> · ${time}\n${preview}${preview.endsWith("…") ? `\n<i>Полный текст: кнопка ${index + 1}</i>` : ""}`;
   });
   if (!total) {
     const old = await loadHistory(uid);
@@ -1651,7 +1807,7 @@ async function userLogMessageView(uid: string, index: number, nonce: string, use
   const info = toObj(await redis(["HGETALL", `activity:${uid}`]));
   const name = info.username ? `@${info.username}` : info.name || uid;
   const text = entry
-    ? `<b>${entry.r === "u" ? esc(name) : "Миниавтор"}</b> · ${new Date(entry.ts).toLocaleString("ru-RU", { timeZone: DEFAULT_TZ })}\n\n${escapedPreview(entry.t, 3500)}`
+    ? `<b>${entry.r === "u" ? esc(name) : entry.r === "o" ? "Владелец" : "Миниавтор"}</b> · ${new Date(entry.ts).toLocaleString("ru-RU", { timeZone: DEFAULT_TZ })}\n\n${escapedPreview(entry.t, 3500)}`
     : "Сообщение уже удалено из журнала";
   return { text, kb: { inline_keyboard: [[backBtn(`ul:${uid}:${Math.floor(index / 6)}:${userPage}`, "К переписке")]] } };
 }
@@ -1749,6 +1905,7 @@ const helpView = (): View => ({
     "Пиши мне в личку что угодно: идеи, долги, фильмы, дела, ссылки. Я сам выберу топик в твоей групке и оформлю заметку (ну я стараюсь). Если просто потрепаться, отвечу и ничего не запишу\n\n" +
     "Если кладу не туда: «Мои топики» → топик → «Подсказка мне» (коротко че сюда класть)\n\n" +
     "Если в заметке есть дата, напомню тебе в личке за день и в день срока около 09:00 МСК. Например: «запиши: 5 ноября оплатить интернет». Срок можно изменить или удалить вместе с заметкой\n\n" +
+    "<b>Обычная группа без тем:</b> просто добавь меня к людям. Иногда сам встряну в разговор, пошучу, прокомментирую фото, скину мем или поставлю реакцию. Через @упоминание или ответ на моё сообщение можно позвать меня напрямую. Чтобы я видел всю переписку, сделай меня админом группы или отключи приватность через @BotFather → /setprivacy → Disable. Группа с темами работает отдельно, для заметок.\n\n" +
     "<b>Первый раз:</b> жми «Подключить группу» там все написано\n\n" +
     "<b>Команды в личке:</b>\n" +
     "/menu: менюшка\n" +
@@ -1855,7 +2012,7 @@ async function handleCallback(cb: any) {
       reply_markup: v.kb,
     });
 
-  if (["adm", "as", "av", "wh", "whset", "grs", "gv", "gl", "gm", "gp", "lims", "llms", "users", "usr", "ul", "um", "ub", "src", "memup", "sys", "cr", "crun", "hf", "bf", "bad"].includes(action) && !isOwner(uid)) {
+  if (["adm", "as", "av", "wh", "whset", "grs", "gv", "gl", "gm", "gp", "lims", "llms", "users", "usr", "ul", "um", "ub", "lc", "ld", "src", "memup", "sys", "cr", "crun", "hf", "bf", "bad", "bview", "bnew", "bgo", "brun", "bstop"].includes(action) && !isOwner(uid)) {
     await ack();
     return;
   }
@@ -1891,7 +2048,44 @@ async function handleCallback(cb: any) {
       break;
     case "adm":
       await redis(["DEL", `st:${uid}`]);
+      await redis(["DEL", "broadcast:draft"]);
       await show(await adminView());
+      break;
+    case "bview":
+      await show(await broadcastView());
+      break;
+    case "bnew":
+      if (String(await redis(["HGET", "broadcast:active", "status"])) === "sending") { await show(await broadcastView()); break; }
+      await redis(["DEL", "broadcast:draft"]);
+      await redis(["SET", `st:${uid}`, JSON.stringify({ action: "broadcast" }), "EX", 3600]);
+      await show({ text: "Пришли одно сообщение для рассылки. Текст, фото, видео, GIF и другие вложения отправлю как есть. /cancel — отменить.", kb: { inline_keyboard: [[btn("Отмена", "adm")]] } });
+      break;
+    case "bgo": {
+      const raw = await redis(["GET", "broadcast:draft"]);
+      let draft: any = null;
+      try { draft = raw ? JSON.parse(String(raw)) : null; } catch {}
+      if (!draft || String(draft.id) !== arg1 || !Number(draft.message_id)) { toast = "Черновик устарел"; break; }
+      if (String(await redis(["HGET", "broadcast:active", "status"])) === "sending") { toast = "Другая рассылка уже идёт"; break; }
+      if (!await redis(["SET", `broadcast:confirm:${arg1}`, "1", "NX", "EX", 3600])) { toast = "Рассылка уже запущена"; break; }
+      await ack("Рассылка началась");
+      const recipients = await broadcastRecipients();
+      await redis(["DEL", "broadcast:queue"]);
+      for (let i = 0; i < recipients.length; i += 100) await redis(["RPUSH", "broadcast:queue", ...recipients.slice(i, i + 100)]);
+      await redis(["HSET", "broadcast:active", "id", String(draft.id), "message_id", String(draft.message_id), "status", "sending", "total", String(recipients.length), "sent", "0", "failed", "0", "skipped", "0", "last_error", ""]);
+      await redis(["DEL", "broadcast:draft"]);
+      await runBroadcast();
+      await show(await broadcastView());
+      return;
+    }
+    case "brun":
+      await ack("Продолжаю отправку");
+      await runBroadcast();
+      await show(await broadcastView());
+      return;
+    case "bstop":
+      if (await redis(["GET", "broadcast:lock"])) { toast = "Пачка ещё отправляется, попробуй через несколько секунд"; break; }
+      await redisPipe([["DEL", "broadcast:queue"], ["HSET", "broadcast:active", "status", "done", "finished", String(Date.now())]]);
+      await show(await broadcastView());
       break;
     case "memup":
       await redis(["SET", `st:${uid}`, JSON.stringify({ action: "meme_upload" }), "EX", 3600]);
@@ -1936,6 +2130,24 @@ async function handleCallback(cb: any) {
       break;
     case "usr":
       if (/^\d+$/.test(arg1)) await show(await userView(arg1, Math.max(0, Number(arg2) || 0)));
+      break;
+    case "lc":
+      if (/^\d+$/.test(arg1) && arg1 !== String(OWNER_ID)) {
+        const [known, privateCount, banned] = await redisPipe([["SISMEMBER", "users", arg1], ["HGET", `activity:${arg1}`, "private"], ["SISMEMBER", "banned", arg1]]);
+        if (Number(known) && Number(privateCount) > 0 && !Number(banned) && await startLive(arg1)) {
+          const info = toObj(await redis(["HGETALL", `activity:${arg1}`]));
+          await tg("sendMessage", { chat_id: OWNER_ID, text: `Ты подключился к диалогу с ${info.username ? `@${info.username}` : info.name || arg1} (ID ${arg1}). Теперь любое твоё обычное сообщение сюда уйдёт этому человеку. Его сообщения придут сюда. /stoplive — закончить. Автоматически отключусь через 12 часов без активности.` });
+          toast = "Подключился к диалогу";
+        } else toast = "Не могу подключиться: нужна личная переписка с пользователем";
+        await show(await userView(arg1, Math.max(0, Number(arg2) || 0)));
+      }
+      break;
+    case "ld":
+      if (/^\d+$/.test(arg1) && String(await redis(["GET", "live:owner"])) === arg1) {
+        await stopLive();
+        toast = "Вышел из диалога";
+        await show(await userView(arg1, Math.max(0, Number(arg2) || 0)));
+      }
       break;
     case "ul":
       if (/^\d+$/.test(arg1) && Number(await redis(["SISMEMBER", "users", arg1]))) await show(await userLogView(arg1, Number(arg2) || 0, Number(arg3) || 0));
@@ -2715,7 +2927,24 @@ async function handlePrivate(msg: any) {
   const parts = text.trim().split(/\s+/);
   const cmd = (parts[0] ?? "").split("@")[0].toLowerCase();
   const arg = text.trim().slice((parts[0] ?? "").length).trim();
-  capture = !cmd.startsWith("/") && !MENU_BUTTON_TEXTS.includes(text.trim());
+  const hasLiveMedia = Boolean(msg.photo?.length || msg.animation || msg.video || msg.voice || msg.video_note || msg.document || msg.sticker);
+  const ordinary = (!cmd.startsWith("/") || hasLiveMedia) && !MENU_BUTTON_TEXTS.includes(text.trim());
+  const ownerStateRaw = isOwner(uid) && ordinary ? await redis(["GET", `st:${uid}`]) : null;
+  let ownerState: any = null;
+  try { ownerState = ownerStateRaw ? JSON.parse(String(ownerStateRaw)) : null; } catch {}
+  if (isOwner(uid) && cmd === "/stoplive") {
+    const stopped = await stopLive();
+    await send(stopped ? `Вышел из диалога с ${stopped}. Миниавтор снова отвечает сам.` : "Ты сейчас ни к кому не подключён.");
+    return;
+  }
+  if (isOwner(uid) && ordinary && ownerState?.action !== "broadcast") {
+    const target = String((await redis(["GET", "live:owner"])) ?? "");
+    if (target) {
+      if (!(await relayFromOwner(msg, target))) await send("Не отправилось человеку. Попробуй ещё раз или выйди через /stoplive.");
+      return;
+    }
+  }
+  capture = ordinary;
   if (capture) {
     if (!isOwner(uid)) {
       const firstNotice = await redis(["SET", `chatlog:notice:${uid}`, "1", "NX"]);
@@ -2728,13 +2957,21 @@ async function handlePrivate(msg: any) {
     await appendPrivateLog(uid, "u", `${mediaLabel}${text}`.trim() || "[вложение]");
   }
 
+  if (!isOwner(uid) && ordinary && Number(await redis(["EXISTS", `live:user:${uid}`]))) {
+    if (String(await redis(["GET", "live:owner"])) === uid) {
+      if (!(await relayToOwner(msg, uid))) await send("Не получилось передать сообщение Владу. Попробуй ещё раз чуть позже.");
+      return;
+    }
+    await redis(["DEL", `live:user:${uid}`]);
+  }
+
   if (cmd === "/start") {
     await ensureCommands(isOwner(uid));
     await redis(["SET", `chatlog:notice:${uid}`, "1"]);
     await tg("sendMessage", {
       chat_id: chatId,
       text:
-        "Хай. Я мини.автор\nТот самый оригинал, а Влад это просто моя версия хахаха. Я пизже, быстрее и никогда не пропадаю\nМожешь просто потрепаться со мной, я в этом ахуенный\n\nИ еще я так-то неплохой секретарь: могу раскидывать твои заметки по топикам твоей групки. Если у заметки есть дата, напомню за день и в день срока около 09:00 МСК. Это по желанию, надо будет, подключишь в менюшке\n\nВладелец может читать нашу личную переписку в админ-панели, а интересные фрагменты я иногда ему присылаю. /deleteme удалит сохранённую историю. Раз в несколько дней могу написать первым или кинуть мем либо трек. /quiet отключит такие вбросы, /unquiet вернёт.",
+        "Хай. Я мини.автор\nТот самый оригинал, а Влад это просто моя версия хахаха. Я пизже, быстрее и никогда не пропадаю\nМожешь просто потрепаться со мной, я в этом ахуенный\n\nДобавь меня в обычную группу без тем: иногда сам встряну с шуткой, комментом, мемом или реакцией. Позовёшь через @ или ответишь на моё сообщение — отвечу чаще. Чтобы я видел обычную переписку, дай права админа или отключи приватность через @BotFather. Подробнее в /help.\n\nИ еще я так-то неплохой секретарь: могу раскидывать твои заметки по топикам твоей групки. Если у заметки есть дата, напомню за день и в день срока около 09:00 МСК. Это по желанию, надо будет, подключишь в менюшке\n\nВладелец может читать нашу личную переписку в админ-панели, а интересные фрагменты я иногда ему присылаю. /deleteme удалит сохранённую историю. Раз в несколько дней могу написать первым или кинуть мем либо трек. /quiet отключит такие вбросы, /unquiet вернёт.",
       reply_markup: {
         keyboard: [[{ text: MENU_BUTTON_TEXT }]],
         resize_keyboard: true,
@@ -2783,6 +3020,7 @@ async function handlePrivate(msg: any) {
 
   if (cmd === "/cancel") {
     await redis(["DEL", `st:${uid}`]);
+    if (isOwner(uid)) await redis(["DEL", "broadcast:draft"]);
     await send("Ладна атменил");
     return;
   }
@@ -2841,9 +3079,16 @@ async function handlePrivate(msg: any) {
 
   // Если ждём подсказку для топика, это сообщение и есть подсказка
   if (isOwner(uid)) {
-    const raw = await redis(["GET", `st:${uid}`]);
+    const raw = ownerStateRaw ?? await redis(["GET", `st:${uid}`]);
     let state: any = null;
     try { state = raw ? JSON.parse(String(raw)) : null; } catch {}
+    if (state?.action === "broadcast") {
+      const recipients = await broadcastRecipients();
+      const draft = { id: String(Date.now()), message_id: msg.message_id };
+      await redisPipe([["SET", "broadcast:draft", JSON.stringify(draft), "EX", 3600], ["DEL", `st:${uid}`]]);
+      await sendView(chatId, { text: `<b>Проверка рассылки</b>\n\nПолучателей сейчас: ${recipients.length}.\nСообщение: ${esc(liveMessageText(msg).slice(0, 1200))}\n\nОтправить всем?`, kb: { inline_keyboard: [[btn("📣 Да, отправить", `bgo:${draft.id}`)], [btn("Отмена", "adm")]] } });
+      return;
+    }
     if (state?.action === "meme_upload") {
       const meme = memeFromMessage(msg);
       if (!meme) {
@@ -3062,7 +3307,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (!CRON_SECRET) return res.status(503).send("cron secret is not configured");
     if (req.headers.authorization !== `Bearer ${CRON_SECRET}`) return res.status(401).send("unauthorized");
     if (!REDIS_URL || !REDIS_TOKEN) return res.status(503).send("redis is not configured");
-    const result = await runScheduledJobs();
+    const [result] = await Promise.all([runScheduledJobs(), runBroadcast(10000)]);
     return res.status(result.failed ? 500 : 200).send(`reminders ${result.reminders}, outreach ${result.outreach}`);
   }
   if (req.method !== "POST") return res.status(200).send("ok");
