@@ -42,5 +42,5 @@ test("imports regular stickers from a set and sends one as a meme", async () => 
   const sticker = calls.find((x) => x.method === "sendSticker");
   assert.equal(sticker.payload.sticker, "abc");
   assert.equal(sticker.payload.reply_parameters.message_id, 42);
-  assert.equal(calls.find((x) => x.method === "sendMessage").payload.text, "ну ты");
+  assert.equal(calls.some((x) => x.method === "sendMessage"), false);
 });
