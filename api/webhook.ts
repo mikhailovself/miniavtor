@@ -1,5 +1,9 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { friendContext, isKnownFriend } from "./friends.js";
+import {
+  amendNote, cleanNote, dedupeNotes, esc, findSimilarSaved, formatNote, MAX_CAPTION, MAX_TEXT,
+  type Note, type NoteUpdate, type SavedNote,
+} from "./notes.js";
 
 const {
   TELEGRAM_BOT_TOKEN,
@@ -48,27 +52,10 @@ async function setting(key: Setting): Promise<number> {
     : key === "chatter" ? CHANCE : key === "meme" ? 0.3 : key === "forward" ? 0.05 : key === "daily" ? LIMIT : 60;
 }
 
-type Note = {
-  topic: string; // название топика
-  title: string;
-  body: string;
-  emoji?: string;
-  tags?: string[];
-  who?: string;
-  amount?: string;
-  direction?: "owes_me" | "i_owe";
-  deadline?: string;
-};
-type SavedNote = { id: string; chat: string; thread: number; message: number; photo: boolean; note: Note };
-type NoteUpdate = {
-  id: string; action: "edit" | "paid" | "delete" | "watched" | "done";
-  remaining_amount?: string; topic?: string; title?: string; body?: string; emoji?: string;
-  who?: string; amount?: string; direction?: "owes_me" | "i_owe"; deadline?: string; tags?: string[];
-  clear_fields?: string[];
-};
+// Типы заметок (Note, SavedNote, NoteUpdate), оформление, списки и поиск дублей лежат в notes.ts
 
 async function recentNotes(uid: string): Promise<SavedNote[]> {
-  const ids: string[] = ((await redis(["ZREVRANGE", `notes:${uid}`, 0, 29])) ?? []).map(String);
+  const ids: string[] = ((await redis(["ZREVRANGE", `notes:${uid}`, 0, 39])) ?? []).map(String);
   if (!ids.length) return [];
   const rows = await redis(["HMGET", `note:${uid}`, ...ids]);
   return ((rows ?? []) as (string | null)[]).flatMap((raw) => {
@@ -77,7 +64,7 @@ async function recentNotes(uid: string): Promise<SavedNote[]> {
 }
 
 async function rememberNote(uid: string, item: SavedNote) {
-  await redisPipe([["HSET", `note:${uid}`, item.id, JSON.stringify(item)], ["ZADD", `notes:${uid}`, Date.now(), item.id]]);
+  await redisPipe([["HSET", `note:${uid}`, item.id, JSON.stringify({ ...item, ts: Date.now() })], ["ZADD", `notes:${uid}`, Date.now(), item.id]]);
   const old: string[] = ((await redis(["ZREVRANGE", `notes:${uid}`, 100, -1])) ?? []).map(String);
   if (old.length) await redisPipe([["HDEL", `note:${uid}`, ...old], ["ZREM", `notes:${uid}`, ...old]]);
 }
@@ -86,7 +73,6 @@ type Topic = { id: number; name: string; desc?: string; label: string };
 type User = { id: string; group?: string };
 type Cmd = (string | number)[];
 
-const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
 // Названия, которые считаются «общим» топиком на случай, когда тема не подошла никуда
 const DEFAULT_WORDS = ["заметк", "разное", "другое", "other", "notes", "inbox"];
@@ -432,14 +418,20 @@ async function loadAttach(a: Attach): Promise<Media | null> {
 // ---------- Нейросети ----------
 
 // Как оформлять сами заметки в группе (адекватно, без мата и опечаток)
-const NOTE_STYLE = `Стиль заметок (title, body): адекватный и аккуратный, обычный русский язык, коротко и по делу. Без мата, подъёбов, смеха, намеренных опечаток, словечек вроде «хз», «ща», «бро» и эмодзи в тексте (эмодзи только в поле emoji). title 2-5 слов, body 1-2 короткие строки или список через «•». Смысл не меняй и ничего не выдумывай.
+const NOTE_STYLE = `Стиль заметок (title, body, items): адекватный и аккуратный, обычный русский язык, коротко и по делу. Без мата, подъёбов, смеха, намеренных опечаток, словечек вроде «хз», «ща», «бро» и эмодзи в тексте (эмодзи только в поле emoji). title 2-5 слов: предмет заметки. body 0-3 короткие строки, только то, чего нет в title. Смысл не меняй и ничего не выдумывай.
 
-Примеры оформления заметок (только манера, содержание бери из сообщения):
-- Вход: «Саня должен мне 2000 за билеты» → title: «Саня за билеты», body: «Должен 2000 за билеты»
-- Вход: «идея для видоса: неделю без телефона» → title: «Видео про неделю без телефона», body: «Неделю не пользоваться телефоном и снять, как это пройдёт»
+Заметка это выжимка, а не пересказ. Выкидывай «надо», «запиши», «короче», «в общем», «кстати», приветствия и повторы. Не копируй фразу пользователя в title и в body одновременно. Каждый факт пиши один раз.
+
+Примеры оформления (только манера, содержание бери из сообщения):
+- Вход: «Саня должен мне 2000 за билеты» → title: «Саня за билеты», body пустой, who: «Саня», amount: «2000 ₽»
+- Вход: «идея для видоса: неделю без телефона» → title: «Видео про неделю без телефона», body: «Снять, как пройдёт неделя без телефона»
 - Вход: «посмотреть фильм Одержимость друг посоветовал» → title: «Одержимость», body: «Фильм, посоветовал друг»
-- Вход: «завтра в 6 созвон по презе с командой» → title: «Созвон по презентации», body: «Завтра в 18:00 с командой»
-- Вход: «купить молоко хлеб и кофе» → title: «Купить в магазине», body: «Молоко\nХлеб\nКофе»
+- Вход: «завтра в 6 созвон по презе с командой» → title: «Созвон по презентации», body: «С командой, в 18:00», deadline: завтрашняя дата
+- Вход: «короче вчера глянул Дюну, очень зашла, особенно визуал и музыка» (заметки про Дюну ещё нет) → save_note: title: «Дюна», emoji: 🎬, body: «Очень понравилась\nОсобенно визуал и музыка»
+- Вход: «кстати в Дюне финал слабоват» (заметка «Дюна» уже есть) → update_note: action=amend, add_lines: [«Финал слабоват»]
+- Вход: «купить молоко хлеб и кофе» → save_note: title: «Покупки», emoji: 🛒, items: [«Молоко», «Хлеб», «Кофе»], body пустой
+- Вход: «добавь в покупки ещё сыр» (список «Покупки» уже есть) → update_note: action=amend, add_items: [«Сыр»]
+- Вход: «купил хлеб и молоко» → update_note: action=amend, check_items: [«Хлеб», «Молоко»]
 
 Имена людей, суммы, даты, названия фильмов, сериалов, игр и треков, ссылки, номера, теги и значения полей who, amount, deadline пиши абсолютно точно.`;
 
@@ -616,15 +608,34 @@ https://www.instagram.com/reel/C_KuRKMg9JW/
 - Не придумывай факты про настоящего Влада и его круг. Если не знаешь, скажи «хз», «не помню», «я забыл».
 - Не выдавай чужие личные данные и не пиши всерьёз оскорбления в адрес групп людей.`;
 
+// Как заметка выглядит в списке «недавних» для нейросети: полный текст и пункты списка, чтобы она не теряла детали
+function describeSaved(s: SavedNote): string {
+  const n = s.note;
+  const parts = [`id=${s.id}`, `топик=${n.topic}`, `заголовок=${n.title}`];
+  if (n.who) parts.push(`участник=${n.who}`);
+  if (n.amount) parts.push(`остаток=${n.amount}`);
+  if (n.deadline) parts.push(`срок=${n.deadline}`);
+  if (n.body) parts.push(`текст=${n.body.replace(/\n+/g, " / ").slice(0, 400)}`);
+  if (n.items?.length) {
+    const shown = n.items.slice(0, 30).map((i) => `${i.done ? "✅" : "⬜"}${i.text}`).join(" | ");
+    parts.push(`пункты: ${shown}${n.items.length > 30 ? ` (и ещё ${n.items.length - 30})` : ""}`);
+  }
+  return `- ${parts.join("; ")}`;
+}
+
 function buildSystemPrompt(topics: Topic[], fallback: Topic | undefined, saved: SavedNote[] = [], memories: ChatMemory[] = [], personId = ""): string {
   const today = new Date().toLocaleDateString("sv-SE", { timeZone: DEFAULT_TZ });
   const list = topics.length
     ? topics.map((t) => `- «${t.label}»${t.desc ? `: ${t.desc}` : ""}`).join("\n")
     : "(топики пока не заданы, сохранять заметки нельзя)";
-  return `Ты личный секретарь пользователя (в разговоре ты в роли персонажа из блока про стиль, если он есть). Он пишет тебе сырые мысли, иногда сумбурно, с опечатками, голосом или пересланным текстом. Твоя задача: сначала понять, это заметка или просто разговор. Заметка: выбрать подходящий топик из списка и вызвать функцию save_note с аккуратно оформленной заметкой. Если человек обновляет существующую заметку, вызови update_note. Разговор: вызвать функцию chat_reply с коротким ответом, ничего не сохраняя.
+  return `Ты личный секретарь пользователя (в разговоре ты в роли персонажа из блока про стиль, если он есть). Он пишет тебе сырые мысли, иногда сумбурно, с опечатками, голосом или пересланным текстом. Сначала пойми, что это:
+- новая заметка или новый список: выбери подходящий топик из списка и вызови save_note;
+- дополнение к уже сохранённой заметке или списку (новая деталь, впечатление, оценка, прогресс, ещё один пункт, отметка «купил», «сделал», «посмотрел»): вызови update_note;
+- разговор: вызови chat_reply с коротким ответом, ничего не сохраняя.
 
 Недавние сохранённые заметки (можно менять только их):
-${saved.length ? saved.map((s) => `- id=${s.id}; топик=${s.note.topic}; заголовок=${s.note.title}; ${s.note.who ? `участник=${s.note.who}; ` : ""}${s.note.amount ? `остаток=${s.note.amount}; ` : ""}${s.note.deadline ? `срок=${s.note.deadline}; ` : ""}${s.note.body ? `текст=${s.note.body.slice(0, 180)}` : ""}`).join("\n") : "(нет сохранённых заметок для изменения)"}
+${saved.length ? saved.map(describeSaved).join("\n") : "(нет сохранённых заметок для изменения)"}
+
 
 Факты, которые пользователь отдельно попросил помнить в личке:
 ${memories.length ? memories.slice(0, 20).map(memoryLine).join("\n") : "(нет)"}
@@ -647,17 +658,30 @@ ${fallback ? `- Если ничего не подходит, выбери «${fa
 - Если сохраняешь или меняешь заметку, не шути о том, что отказался, и не утверждай, что ничего не записал. Подтверждение отправит бот после успешного действия.
 - Если человек говорит, что часть долга вернули, используй update_note с action=paid и remaining_amount — новым остатком. Вычти возвращённую сумму из текущего долга. Если остаток ноль, action=delete. Не создавай новую заметку о том же долге.
 - Если человек говорит, что долг закрыт полностью, используй update_note с action=delete. Если фильм просмотрен, используй action=watched. Для завершённого дела используй action=done. Любую другую существующую заметку можно изменить или удалить: используй action=edit с нужными полями или action=delete. Можно менять заголовок, текст, топик, эмодзи, теги, срок и поля долга. Для очистки поля передай clear_fields. Не создавай новую заметку вместо правки.
-- Для body при редактировании передавай полный новый текст, сохраняя важные прежние детали; остальные поля не передавай, если они не меняются. Для topic используй точное название одного из доступных топиков.
+- Для body при редактировании (action=edit) передавай полный новый текст, только если нужно переписать его целиком. Чтобы просто добавить факт или пункт, используй action=amend: старый текст передавать не надо, он сохранится как есть. Для topic используй точное название одного из доступных топиков.
 - Выбирай id только при однозначном совпадении заметки. Если подходящей заметки нет или их несколько, уточни через chat_reply; не меняй наугад. Старые заметки до появления этой функции не перечислены.
 - Ответ в разговоре (chat_reply): пиши строго по персонажу «минимавтор» из блока ниже, его манера главнее любых других правил про вежливость и длину. Строки в ответе станут отдельными сообщениями.
 - Ты видишь последние сообщения диалога, можешь на них опираться.
 - Если топиков нет, save_note недоступен: на просьбу записать ответь, что топики группы ещё не запомнены, и подскажи открыть «Менюшка» → «Подключить группу»: там инструкция.
 
+Сначала ищи, потом создавай (главное правило против дублей):
+- Перед save_note просмотри недавние заметки. Если сообщение про ту же вещь, что уже записана (тот же фильм, сериал, книга, игра, трек, место, человек, проект, покупка, дело, идея), НЕ создавай новую заметку, а вызови update_note с action=amend.
+- Что считается дополнением: впечатление или оценка («понравился», «зашёл саундтрек», «слабый финал»), новая деталь, прогресс («дошёл до третьего сезона», «прочитал половину»), новые сведения о человеке или месте, ещё один пункт в уже существующий список, отметка выполнения.
+- В add_lines передай короткие строки только с НОВЫМИ фактами, каждая строка один факт, своими словами, без повтора того, что уже записано. Остальной текст заметки не пересказывай и не передавай.
+- Если про этот предмет заметки ещё нет, а человек рассказывает впечатление («посмотрел, понравилось, потому что...»), создай заметку: title это название, body это его впечатление выжимкой.
+- Если заметка похожа, но речь о другом (другая серия, другой человек, другая дата), создай новую.
+
+Списки:
+- Если человек просит составить список или перечисляет несколько однотипных вещей (купить, взять с собой, сделать, посмотреть, пригласить, послушать), сохрани ОДНУ заметку со списком: пункты в items по одному, body пустой (или одна строка пояснения). title это название списка («Покупки», «Фильмы на выходные»), emoji по теме. Не склеивай пункты в одну строку и не пиши их в body.
+- Если такой список уже есть в недавних заметках, то «добавь в список...», «ещё купить...», «и ещё...» это update_note, action=amend, add_items. Новый список не создавай, даже если подходит другой топик.
+- «Купил молоко», «взял хлеб», «сделал первое» это amend с check_items (текст пункта как в списке). Убрать пункт совсем: remove_items. Вернуть отмеченный пункт: uncheck_items. «Очисти купленное» или «убери выполненное»: clear_done=true.
+- Пункты короткие: что именно, без «надо» и «купить» в каждом. Количество и уточнение оставляй («Яйца, 10 шт»).
+
 Правила оформления:
 - title: коротко, до 60 символов, без эмодзи.
 - emoji: один эмодзи, подходящий по смыслу заметки.
-- body: коротко, без воды, можно списки через «•». Ничего не выдумывай: если данных нет, не добавляй их. Не меняй смысл, не добавляй советов.
-- Не повторяй в body заголовок, участника долга, сумму, дату или теги: они выводятся отдельными строками. Если дополнительных деталей нет, body оставь пустым. Каждую мысль напиши один раз.
+- body: только то, чего нет в title; 0-3 короткие строки, можно списком через «•». Не пересказывай сообщение пользователя. Ничего не выдумывай: если данных нет, не добавляй их. Не меняй смысл, не добавляй советов. Если добавить нечего, body оставь пустым.
+- Не повторяй в body заголовок, участника долга, сумму, дату, теги и пункты списка: они выводятся отдельно. Каждую мысль напиши один раз.
 - Имена людей, суммы, даты, названия фильмов, сериалов, игр и треков, ссылки, номера, теги и значения полей who, amount, deadline переноси абсолютно точно. Смысл заметки сохраняй полностью.
 - Если в заметке про деньги кто-то кому-то должен, заполни who, amount (с валютой, по умолчанию ₽) и direction: "owes_me" если должны пользователю, "i_owe" если должен он.
 - Если назван срок или дата (дело, напоминание, план), заполни deadline в формате ГГГГ-ММ-ДД, считая от сегодняшней даты.
@@ -727,37 +751,50 @@ async function coolDown(p: Provider, status: number) {
   } catch {}
 }
 
+const STR_LIST = (description: string) => ({ type: "array", items: { type: "string" }, description });
+
 const NOTE_DECLARATION = {
   name: "save_note",
-  description: "Сохраняет оформленную заметку в нужный топик группы.",
+  description: "Сохраняет НОВУЮ заметку или НОВЫЙ список в нужный топик группы. Если такая заметка уже есть среди недавних, вместо этого вызови update_note.",
   parameters: {
     type: "object",
     properties: {
       topic: { type: "string" } as Record<string, unknown>,
-      title: { type: "string" },
-      body: { type: "string" },
+      title: { type: "string", description: "Предмет заметки, 2-5 слов" },
+      body: { type: "string", description: "Только то, чего нет в title. Для списка оставь пустым" },
       emoji: { type: "string" },
       tags: { type: "array", items: { type: "string" } },
+      items: STR_LIST("Пункты списка по одному (покупки, дела, что посмотреть, что взять). Только для списков"),
       who: { type: "string", description: "Только для долгов" },
       amount: { type: "string", description: "Только для долгов, например '3000 ₽'" },
       direction: { type: "string", enum: ["owes_me", "i_owe"], description: "Только для долгов" },
       deadline: { type: "string", description: "Срок, ГГГГ-ММ-ДД" },
     },
-    required: ["topic", "title", "body"],
+    required: ["topic", "title"],
   },
 };
 const UPDATE_DECLARATION = {
   name: "update_note",
-  description: "Меняет ранее сохранённую заметку по точному id. Используй только для однозначно найденной заметки.",
+  description: "Меняет ранее сохранённую заметку или список по точному id. Используй только для однозначно найденной заметки. Чтобы ДОПОЛНИТЬ заметку или отметить пункты списка, используй action=amend.",
   parameters: {
     type: "object",
     properties: {
       id: { type: "string" },
-      action: { type: "string", enum: ["edit", "paid", "delete", "watched", "done"] },
+      action: {
+        type: "string",
+        enum: ["amend", "edit", "paid", "delete", "watched", "done"],
+        description: "amend: дописать факты или пункты, отметить, убрать пункт (остальное не трогается). edit: переписать поля. paid: частичный возврат долга. delete: удалить. watched: фильм просмотрен. done: дело выполнено.",
+      },
+      add_lines: STR_LIST("Для amend: новые факты одной короткой строкой каждый (впечатления, детали, прогресс). Только новое, без повтора записанного"),
+      add_items: STR_LIST("Для amend: новые пункты списка"),
+      check_items: STR_LIST("Для amend: пункты списка, которые выполнены или куплены (текст как в списке)"),
+      uncheck_items: STR_LIST("Для amend: пункты, с которых нужно снять отметку"),
+      remove_items: STR_LIST("Для amend: пункты, которые нужно убрать из списка совсем"),
+      clear_done: { type: "boolean", description: "Для amend: убрать из списка все отмеченные пункты" },
       remaining_amount: { type: "string", description: "Для paid: новый остаток долга с валютой" },
       topic: { type: "string", description: "Новый топик, если переносишь заметку" },
       title: { type: "string", description: "Новое название для edit" },
-      body: { type: "string", description: "Полный новый текст для edit" },
+      body: { type: "string", description: "Для edit: полный новый текст. Для добавления используй amend" },
       emoji: { type: "string" },
       tags: { type: "array", items: { type: "string" } },
       who: { type: "string" },
@@ -896,7 +933,15 @@ async function runLLM(system: string, turns: ChatTurn[], decls: any[]): Promise<
 
   const errors: string[] = [];
   let answeredEmpty = false;
+  // Функция живёт максимум 30 секунд (vercel.json). Если все модели медленные, не начинаем новую попытку слишком поздно:
+  // иначе Vercel обрывает функцию, а Telegram присылает то же сообщение ещё раз
+  const started = Date.now();
+  const budget = withMedia ? 10000 : 16000;
   for (const p of ordered) {
+    if (errors.length && Date.now() - started > budget) {
+      errors.push("время вышло, остальные модели не пробовал");
+      break;
+    }
     try {
       const res = p.kind === "gemini" ? await callGemini(p, turns, system, decls) : await callOpenAI(p, turns, system, decls);
       await redis(["HINCRBY", `llm:${new Date().toISOString().slice(0, 10)}`, `${p.name}:ok`, 1]);
@@ -928,45 +973,20 @@ async function extractNotes(text: string, topics: Topic[], fallback: Topic | und
   const decls = topics.length ? [noteDecl, ...(saved.length ? [updateDecl] : []), CHAT_DECLARATION] : [CHAT_DECLARATION];
   const turns = buildTurns(history, text);
   if (media && turns.length) turns[turns.length - 1].media = media;
-  return runLLM(system, turns, decls);
-}
-
-const safeEmoji = (e?: string) => (e && e.length <= 8 ? e : "📌");
-
-function formatNote(n: Note): string {
-  const lines: string[] = [`${safeEmoji(n.emoji)} <b>${esc(n.title)}</b>`, ""];
-
-  if (n.who || n.amount) {
-    const who = n.who ? esc(n.who) : "?";
-    const amount = n.amount ? esc(n.amount) : "";
-    lines.push(n.direction === "i_owe" ? `Ты должен: <b>${who}</b>, ${amount}` : `<b>${who}</b> должен тебе ${amount}`);
-  }
-
-  if (n.body) {
-    const seen = new Set<string>();
-    const redundant = [n.title, `${n.who ?? ""} ${n.amount ?? ""}`].map((x) => x.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim()).filter(Boolean);
-    const body = n.body.split(/\n+/).map((x) => x.trim()).filter((x) => {
-      const key = x.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
-      const who = String(n.who ?? "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
-      const amount = String(n.amount ?? "").replace(/\D/g, "");
-      const isOnlyDebt = who && amount && key.includes(who) && key.replace(/\D/g, "").includes(amount) && key.split(" ").length <= 9;
-      if (!key || seen.has(key) || redundant.includes(key) || isOnlyDebt) return false;
-      seen.add(key);
-      return true;
-    }).join("\n");
-    if (body) lines.push(esc(body));
-  }
-  if (n.deadline) lines.push("", `📅 До: ${esc(n.deadline)}`);
-  if (n.tags?.length) {
-    lines.push("", n.tags.map((t) => `#${esc(t.replace(/\s+/g, "_").replace(/^#/, ""))}`).join(" "));
-  }
-  return lines.join("\n");
+  const parsed = await runLLM(system, turns, decls);
+  // Чистим пересказы и повторы, одинаковые заметки в одном ответе схлопываем
+  const notes = parsed.notes.flatMap((n) => {
+    const c = cleanNote(n);
+    return c ? [c] : [];
+  });
+  return { ...parsed, notes: dedupeNotes(notes) };
 }
 
 async function applyNoteUpdate(uid: string, update: NoteUpdate, saved: SavedNote[], topics: Topic[]): Promise<string> {
   const item = saved.find((s) => s.id === String(update.id));
-  if (!item || !["edit", "paid", "delete", "watched", "done"].includes(update.action)) return "Не нашёл точную заметку для изменения";
-  const next: Note = { ...item.note };
+  if (!item || !["edit", "paid", "delete", "watched", "done", "amend"].includes(update.action)) return "Не нашёл точную заметку для изменения";
+  let next: Note = { ...item.note };
+  let amended = "";
   const target = update.topic ? topics.find((t) => t.label === update.topic) : topics.find((t) => t.id === item.thread);
   if (!target && update.action !== "delete") return "Не нашёл топик для заметки";
   if (update.action === "paid") {
@@ -979,6 +999,13 @@ async function applyNoteUpdate(uid: string, update: NoteUpdate, saved: SavedNote
       const currency = String(next.amount).replace(/[\d\s.,-]/g, "").trim();
       next.amount = /[₽$€£]|руб|usd|eur/i.test(amount) || !currency ? amount : `${amount} ${currency}`;
     }
+  }
+  if (update.action === "amend") {
+    const r = amendNote(next, update);
+    if (!r.changed) return r.problems.length ? `«${next.title}»: ${r.problems.join("; ")}` : `В «${next.title}» это уже есть`;
+    next = r.note;
+    amended = [r.summary, ...r.problems].join("; ");
+    if (update.topic) next.topic = update.topic;
   }
   if (update.action === "edit") {
     if (update.title?.trim()) next.title = update.title.trim().slice(0, 100);
@@ -1010,6 +1037,8 @@ async function applyNoteUpdate(uid: string, update: NoteUpdate, saved: SavedNote
     if (removed.ok) {
       await redisPipe([["HDEL", `note:${uid}`, item.id], ["ZREM", `notes:${uid}`, item.id]]);
       await replaceReminder(uid, item.note);
+      const at = saved.indexOf(item);
+      if (at >= 0) saved.splice(at, 1);
       return `Удалил «${item.note.title}»`;
     }
     if (!next.who || !next.amount) return `Не смог удалить «${next.title}»: ${String(removed.description ?? "Telegram запретил удаление").slice(0, 120)}`;
@@ -1017,7 +1046,8 @@ async function applyNoteUpdate(uid: string, update: NoteUpdate, saved: SavedNote
     next.amount = undefined;
   }
   const body = formatNote(next);
-  if (item.photo && body.length > 1000) return `Текст «${next.title}» слишком длинный для подписи к фото`;
+  if (body.length > MAX_TEXT) return `«${next.title}» уже слишком длинная для одного сообщения Telegram, не стал дописывать`;
+  if (item.photo && body.length > MAX_CAPTION) return `Текст «${next.title}» слишком длинный для подписи к фото`;
   if (target && target.id !== item.thread) {
     const moved = item.photo
       ? await tg("copyMessage", { chat_id: item.chat, from_chat_id: item.chat, message_id: item.message, message_thread_id: target.id, caption: body, parse_mode: "HTML" })
@@ -1031,6 +1061,7 @@ async function applyNoteUpdate(uid: string, update: NoteUpdate, saved: SavedNote
     }
     await redisPipe([["HDEL", `note:${uid}`, item.id], ["ZREM", `notes:${uid}`, item.id]]);
     await rememberNote(uid, { ...item, id: String(newId), message: newId, thread: target.id, note: next });
+    Object.assign(item, { id: String(newId), message: newId, thread: target.id, note: next }); // следующая правка в этом же ответе видит свежую заметку
     if (item.note.deadline !== next.deadline || item.note.title !== next.title) await replaceReminder(uid, item.note, next);
     return `Перенёс и обновил «${next.title}»`;
   }
@@ -1040,8 +1071,10 @@ async function applyNoteUpdate(uid: string, update: NoteUpdate, saved: SavedNote
   });
   if (!result.ok) return /message is not modified/i.test(String(result.description ?? "")) ? `«${next.title}» уже так записано` : `Не получилось изменить «${item.note.title}»: ${String(result.description ?? "ошибка Telegram").slice(0, 120)}`;
   await rememberNote(uid, { ...item, note: next });
-  if (item.note.deadline !== next.deadline || item.note.title !== next.title) await replaceReminder(uid, item.note, next);
-  return update.action === "watched" ? `Отметил «${next.title}» как просмотренное` : update.action === "done" ? `Отметил «${next.title}» как выполненное` : update.action === "delete" ? `Не смог удалить «${next.title}», отметил как закрытое` : `Обновил «${next.title}»`;
+  const before = item.note;
+  item.note = next; // следующая правка в этом же ответе видит свежую заметку
+  if (before.deadline !== next.deadline || before.title !== next.title) await replaceReminder(uid, before, next);
+  return update.action === "amend" ? `Дополнил «${next.title}»: ${amended}` : update.action === "watched" ? `Отметил «${next.title}» как просмотренное` : update.action === "done" ? `Отметил «${next.title}» как выполненное` : update.action === "delete" ? `Не смог удалить «${next.title}», отметил как закрытое` : `Обновил «${next.title}»`;
 }
 
 // ---------- Меню (кнопки) ----------
@@ -2465,10 +2498,26 @@ async function handlePrivate(msg: any) {
     await send(updateResults.join("\n"));
   }
 
+  // Нейросеть иногда создаёт новую заметку про то, что уже записано: тогда дополняем старую, а не плодим дубль
+  const fresh: Note[] = [];
+  const merged: string[] = [];
+  for (const note of notes) {
+    const dup = findSimilarSaved(savedNotes, note);
+    if (dup) {
+      const r = await applyNoteUpdate(uid, { id: dup.id, action: "amend", add_lines: note.body.split(/\n+/), add_items: (note.items ?? []).map((i) => i.text) }, savedNotes, group.topics);
+      if (/^(Дополнил|В «)/.test(r)) {
+        merged.push(r);
+        continue;
+      }
+    }
+    fresh.push(note);
+  }
+  if (merged.length) await send(merged.join("\n"));
+
   const saved: string[] = [];
   let savedOk = 0;
   let first = true;
-  for (const note of notes) {
+  for (const note of fresh) {
     const target = group.topics.find((t) => t.label === note.topic) ?? fallback;
     if (!target) {
       saved.push(`«${note.title}»: не нашел куда деть`);
@@ -2511,7 +2560,7 @@ async function handlePrivate(msg: any) {
     }
   }
 
-  if (notes.length) {
+  if (fresh.length) {
     const ack = savedOk
       ? (Math.random() < 0.1
           ? pickOne(["Пошёл нахуй... ладно, записал, бро 😈", "Да-да, я типа не записывал. Записал, бро 🤡", "Хотел забить, но записал, бро 🗿"])
@@ -2519,7 +2568,7 @@ async function handlePrivate(msg: any) {
       : "Не получилось записать";
     await send(`${ack}\n${saved.join("\n")}`);
   }
-  await saveHistory(uid, history, input, reply, notes, updateResults.join("; "));
+  await saveHistory(uid, history, input, reply, fresh, [...updateResults, ...merged].join("; "));
 }
 
 // ---------- Основной обработчик ----------
@@ -2539,6 +2588,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   const upd = req.body;
+  // Если функция не успела ответить, Telegram присылает то же сообщение ещё раз, и заметка записывалась бы дважды
+  if (REDIS_URL && typeof upd?.update_id === "number") {
+    try {
+      const key = `upd:${upd.update_id}`;
+      const fresh = await redis(["SET", key, "1", "NX", "EX", 600]);
+      if (!fresh && (await redis(["GET", key])) !== null) return res.status(200).send("ok");
+    } catch {}
+  }
   try {
     if (upd?.callback_query) {
       await handleCallback(upd.callback_query);
