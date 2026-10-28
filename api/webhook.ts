@@ -1723,24 +1723,28 @@ async function limitsView(): Promise<View> {
   return { text: `<b>Лимиты бота</b>\n\nЛичка: ${daily || "без лимита"} запросов на пользователя в сутки; владелец без лимита.\nПрямые обращения: ${addressed} ответов на группу в сутки.\nСамопроизвольные ответы: тихо — 4/сутки и пауза 30 мин; нормально — 8 и 15 мин; часто — 20 и 5 мин.\nСброс суточных счётчиков: 00:00 UTC.\n\nВложения для нейросети: фото 5 МБ, голос 6 МБ и 120 с, кружок 8 МБ и 45 с. Видео в запасе мемов: до 90 с. Фото из обычной группы: до 100 файлов на группу.\nЗаметки: до 100 индексированных, последние 30 в контексте правок.\nТаймаут нейросети: 9 с для текста, 18 с для медиа. Vercel-функция: до 30 с.\nНапоминания: раз в день, 09:00 МСК.\n\nКвоты токенов и денег на стороне Gemini и других провайдеров здесь недоступны.`, kb: { inline_keyboard: [[btn("Личка", "as:daily")], [btn("Группа", "as:addressed")], [backBtn("adm", "В админ-панель")]] } };
 }
 
-async function usersView(page: number): Promise<View> {
-  const start = Math.max(0, Math.min(1000, page * 10));
+async function usersView(page: number, safeLinks = false): Promise<View> {
   const [all, active] = await Promise.all([redis(["SMEMBERS", "users"]), redis(["ZREVRANGE", "activity", 0, -1])]);
   const registered = new Set((all ?? []).map(String));
-  const ids = [...new Set([...(active ?? []).map(String), ...(all ?? []).map(String)])].filter((uid) => registered.has(uid));
+  const ids = [...new Set([...(active ?? []).map(String), ...(all ?? []).map(String).sort()])].filter((uid) => registered.has(uid) && /^\d+$/.test(uid));
+  const currentPage = Math.min(Math.max(0, Math.floor(page) || 0), Math.max(0, Math.ceil(ids.length / 10) - 1));
+  const start = currentPage * 10;
   const shown = ids.slice(start, start + 10);
   const identities = shown.length ? await redisPipe(shown.map((uid) => ["HMGET", `activity:${uid}`, "username", "name"])) : [];
   const rows: Button[][] = shown.map((uid, i) => {
     const [username, name] = (identities[i] ?? []) as (string | null)[];
     const validUsername = profileUrl(username || undefined) ? username : null;
-    return [urlBtn((validUsername ? `@${validUsername}` : name || uid).slice(0, 45), profileLink(uid, validUsername || undefined)), btn("📊 Карточка", `usr:${uid}:${page}`)];
+    const label = (validUsername ? `@${validUsername}` : name || uid).slice(0, 45);
+    const link = validUsername ? profileUrl(validUsername) : safeLinks ? null : profileLink(uid);
+    return [link ? urlBtn(label, link) : btn(label, `usr:${uid}:${currentPage}`), btn("📊 Карточка", `usr:${uid}:${currentPage}`)];
   });
-  rows.push([...(page > 0 ? [btn("←", `users:${page - 1}`)] : []), ...(start + 10 < ids.length ? [btn("→", `users:${page + 1}`)] : [])]);
+  const navigation = [...(currentPage > 0 ? [btn("←", `users:${currentPage - 1}`)] : []), ...(start + 10 < ids.length ? [btn("→", `users:${currentPage + 1}`)] : [])];
+  if (navigation.length) rows.push(navigation);
   rows.push([backBtn("adm", "В админ-панель")]);
-  return { text: `<b>Пользователи</b>\n\nВсего зарегистрировано: ${(all ?? []).length}\nСтраница ${page + 1}. Кнопка с @username или именем открывает профиль Telegram, «Карточка» — статистику и переписку. Если у человека нет публичного username, переход по ID зависит от его настроек приватности. Счётчики активности собираются после обновления.`, kb: { inline_keyboard: rows } };
+  return { text: `<b>Пользователи</b>\n\nВсего зарегистрировано: ${ids.length}\nСтраница ${currentPage + 1} из ${Math.max(1, Math.ceil(ids.length / 10))}. Кнопка с @username открывает профиль Telegram, «Карточка» — статистику и переписку. Если username нет, переход по ID может быть ограничен приватностью; в таком случае имя открывает карточку.`, kb: { inline_keyboard: rows } };
 }
 
-async function userView(uid: string, page: number): Promise<View> {
+async function userView(uid: string, page: number, safeLinks = false): Promise<View> {
   const [info, banned, used, liveTarget] = await redisPipe([["HGETALL", `activity:${uid}`], ["SISMEMBER", "banned", uid], ["GET", `rl:${uid}:${new Date().toISOString().slice(0, 10)}`], ["GET", "live:owner"]]);
   const a = toObj(info);
   const date = Number(a.last) ? new Date(Number(a.last)).toLocaleString("ru-RU", { timeZone: DEFAULT_TZ }) : "нет данных";
@@ -1749,9 +1753,9 @@ async function userView(uid: string, page: number): Promise<View> {
     ? [[btn(live ? "⏹ Выйти из диалога" : "✍️ Подключиться к диалогу", `${live ? "ld" : "lc"}:${uid}:${page}`)]]
     : [];
   const validUsername = profileUrl(a.username) ? a.username : undefined;
-  const url = profileLink(uid, validUsername);
+  const url = validUsername ? profileUrl(validUsername) : safeLinks ? null : profileLink(uid);
   const label = validUsername ? `@${esc(validUsername)}` : esc(a.name || "Пользователь");
-  return { text: `<b><a href="${url}">${label}</a></b>\n\nИмя: ${esc(a.name || "неизвестно")}\nUsername: ${validUsername ? `<a href="${url}">@${esc(validUsername)}</a>` : "не указан"}\nTelegram ID: <code>${esc(uid)}</code>\nПоследняя активность: ${date}\nЛичных сообщений: ${a.private || 0}\nСообщений в группах, увиденных ботом: ${a.group || 0}\nЗапросов к нейросети сегодня: ${used || 0} / ${(await setting("daily")) || "∞"}\nСтатус: ${Number(banned) ? "заблокирован" : "активен"}\nРучной диалог: ${live ? "ты на связи, бот молчит" : "бот отвечает сам"}`, kb: { inline_keyboard: [[urlBtn("Открыть профиль Telegram", url)], [btn("💬 Переписка", `ul:${uid}:0:${page}`)], ...liveButton, [btn(Number(banned) ? "Разблокировать" : "Заблокировать", `ub:${uid}:${page}`)], [backBtn(`users:${page}`, "К пользователям")]] } };
+  return { text: `<b>${url ? `<a href="${url}">${label}</a>` : label}</b>\n\nИмя: ${esc(a.name || "неизвестно")}\nUsername: ${validUsername && url ? `<a href="${url}">@${esc(validUsername)}</a>` : "не указан"}\nTelegram ID: <code>${esc(uid)}</code>\nПоследняя активность: ${date}\nЛичных сообщений: ${a.private || 0}\nСообщений в группах, увиденных ботом: ${a.group || 0}\nЗапросов к нейросети сегодня: ${used || 0} / ${(await setting("daily")) || "∞"}\nСтатус: ${Number(banned) ? "заблокирован" : "активен"}\nРучной диалог: ${live ? "ты на связи, бот молчит" : "бот отвечает сам"}`, kb: { inline_keyboard: [...(url ? [[urlBtn("Открыть профиль Telegram", url)]] : []), [btn("💬 Переписка", `ul:${uid}:0:${page}`)], ...liveButton, [btn(Number(banned) ? "Разблокировать" : "Заблокировать", `ub:${uid}:${page}`)], [backBtn(`users:${page}`, "К пользователям")]] } };
 }
 
 function escapedPreview(value: string, limit: number): string {
@@ -2127,10 +2131,28 @@ async function handleCallback(cb: any) {
       await show(await llmsView());
       break;
     case "users":
-      await show(await usersView(Math.max(0, Number(arg1) || 0)));
+      {
+        const page = Math.max(0, Number(arg1) || 0);
+        const first = await show(await usersView(page));
+        if (!first.ok && !/message is not modified/i.test(String(first.description ?? ""))) {
+          const safe = await usersView(page, true);
+          const second = await show(safe);
+          const fallback = second.ok ? second : await sendView(chatId, safe);
+          toast = fallback.ok ? "Открыл страницу без недоступной ссылки" : "Не удалось открыть страницу, попробуй /admin";
+        }
+      }
       break;
     case "usr":
-      if (/^\d+$/.test(arg1)) await show(await userView(arg1, Math.max(0, Number(arg2) || 0)));
+      if (/^\d+$/.test(arg1)) {
+        const page = Math.max(0, Number(arg2) || 0);
+        const first = await show(await userView(arg1, page));
+        if (!first.ok && !/message is not modified/i.test(String(first.description ?? ""))) {
+          const safe = await userView(arg1, page, true);
+          const second = await show(safe);
+          const fallback = second.ok ? second : await sendView(chatId, safe);
+          toast = fallback.ok ? "Открыл карточку без недоступной ссылки" : "Не удалось открыть карточку, попробуй /admin";
+        }
+      }
       break;
     case "lc":
       if (/^\d+$/.test(arg1) && arg1 !== String(OWNER_ID)) {
