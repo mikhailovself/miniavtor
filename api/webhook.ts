@@ -140,7 +140,7 @@ async function notifyOwner(text: string, dedupeKey?: string) {
 // st:{uid}     STRING ожидаемое действие (ввод подсказки)
 // rl:{uid}:{день}     счётчик сообщений к нейросети
 // users, banned       SET
-// memes               SET    картинки для групп: «p:file_id» (фото), «a:» (гифка), «v:» (видео)
+// memes               SET    медиа для групп: «p:file_id» (фото), «a:» (гифка), «v:» (видео), «s:» (стикер)
 
 async function redis(cmd: Cmd): Promise<any> {
   if (!REDIS_URL || !REDIS_TOKEN) return null;
@@ -642,8 +642,8 @@ async function sendOutreach(uid: string, interval: number): Promise<boolean> {
   if (kind === "meme") {
     const meme = await pickMeme(uid);
     const caption = pickOne(["Смотри че нашёл", "Это ты хахаха", "Без контекста", "Мне кажется тебе надо это видеть", "Я просто оставлю это тут"]);
-    if (meme) sent = await sendMeme(uid, meme, undefined, caption);
-    if (sent) outgoingText = `[мем] ${caption}`;
+    if (meme) sent = await sendMeme(uid, meme, undefined, meme.startsWith("s:") ? undefined : caption);
+    if (sent) outgoingText = meme?.startsWith("s:") ? "[стикер]" : `[мем] ${caption}`;
     if (!sent) kind = "text";
   }
   if (kind === "track" && tracks.length) {
@@ -1498,7 +1498,8 @@ type View = { text: string; kb: { inline_keyboard: Button[][] } };
 const btn = (text: string, data: string): Button => ({ text, callback_data: data });
 const urlBtn = (text: string, url: string): Button => ({ text, url });
 const backBtn = (data = "menu", text = "Назад"): Button => btn(text, data);
-const profileUrl = (username: string | undefined) => username && /^[A-Za-z0-9_]{5,32}$/.test(username) ? `https://t.me/${username}` : null;
+const profileUrl = (username: string | undefined) => username && /^[A-Za-z0-9_]{5,32}$/.test(username) ? `https://t.me/${username}?profile` : null;
+const profileLink = (uid: string, username?: string) => profileUrl(username) ?? `tg://user?id=${uid}`;
 
 async function mainView(user: User): Promise<View> {
   let text = "<b>Менюшка</b>\n\n";
@@ -1668,7 +1669,7 @@ async function broadcastView(): Promise<View> {
 async function memeUploadView(): Promise<View> {
   const stock = await redis(["SCARD", "memes"]);
   return {
-    text: `<b>Загрузка мемов</b>\n\nСейчас в запасе: ${stock ?? 0}\n\nОтправляй сюда фото, GIF или видео до 90 секунд. Можно пересылать из канала или отправлять файл прямо в личку. Каждое принятое медиа подтвержу. Режим действует час и продлевается после каждой загрузки.`,
+    text: `<b>Загрузка мемов и стикеров</b>\n\nСейчас в запасе: ${stock ?? 0}\n\nОтправляй фото, GIF, видео до 90 секунд или отдельные стикеры. Чтобы добавить целый набор, пришли ссылку вида https://t.me/addstickers/название_набора. Можно пересылать медиа из канала. Каждую загрузку подтвержу. Режим действует час и продлевается после каждой загрузки.`,
     kb: { inline_keyboard: [[btn("Закончить", "adm")]] },
   };
 }
@@ -1731,14 +1732,12 @@ async function usersView(page: number): Promise<View> {
   const identities = shown.length ? await redisPipe(shown.map((uid) => ["HMGET", `activity:${uid}`, "username", "name"])) : [];
   const rows: Button[][] = shown.map((uid, i) => {
     const [username, name] = (identities[i] ?? []) as (string | null)[];
-    const url = profileUrl(username || undefined);
-    return url
-      ? [urlBtn(`@${username}`.slice(0, 45), url), btn("📊 Карточка", `usr:${uid}:${page}`)]
-      : [btn((name || uid).slice(0, 50), `usr:${uid}:${page}`)];
+    const validUsername = profileUrl(username || undefined) ? username : null;
+    return [urlBtn((validUsername ? `@${validUsername}` : name || uid).slice(0, 45), profileLink(uid, validUsername || undefined)), btn("📊 Карточка", `usr:${uid}:${page}`)];
   });
   rows.push([...(page > 0 ? [btn("←", `users:${page - 1}`)] : []), ...(start + 10 < ids.length ? [btn("→", `users:${page + 1}`)] : [])]);
   rows.push([backBtn("adm", "В админ-панель")]);
-  return { text: `<b>Пользователи</b>\n\nВсего зарегистрировано: ${(all ?? []).length}\nСтраница ${page + 1}. @username открывает профиль Telegram, «Карточка» — статистику и переписку. Если username нет, имя открывает карточку. Счётчики активности собираются после обновления.`, kb: { inline_keyboard: rows } };
+  return { text: `<b>Пользователи</b>\n\nВсего зарегистрировано: ${(all ?? []).length}\nСтраница ${page + 1}. Кнопка с @username или именем открывает профиль Telegram, «Карточка» — статистику и переписку. Если у человека нет публичного username, переход по ID зависит от его настроек приватности. Счётчики активности собираются после обновления.`, kb: { inline_keyboard: rows } };
 }
 
 async function userView(uid: string, page: number): Promise<View> {
@@ -1749,8 +1748,10 @@ async function userView(uid: string, page: number): Promise<View> {
   const liveButton = uid !== String(OWNER_ID) && Number(a.private) > 0
     ? [[btn(live ? "⏹ Выйти из диалога" : "✍️ Подключиться к диалогу", `${live ? "ld" : "lc"}:${uid}:${page}`)]]
     : [];
-  const url = profileUrl(a.username);
-  return { text: `<b>${a.username ? `@${esc(a.username)}` : esc(a.name || "Пользователь")}</b>\n\nИмя: ${esc(a.name || "неизвестно")}\nUsername: ${a.username ? `@${esc(a.username)}` : "не указан"}\nTelegram ID: <code>${esc(uid)}</code>\nПоследняя активность: ${date}\nЛичных сообщений: ${a.private || 0}\nСообщений в группах, увиденных ботом: ${a.group || 0}\nЗапросов к нейросети сегодня: ${used || 0} / ${(await setting("daily")) || "∞"}\nСтатус: ${Number(banned) ? "заблокирован" : "активен"}\nРучной диалог: ${live ? "ты на связи, бот молчит" : "бот отвечает сам"}`, kb: { inline_keyboard: [...(url ? [[urlBtn("Открыть профиль Telegram", url)]] : []), [btn("💬 Переписка", `ul:${uid}:0:${page}`)], ...liveButton, [btn(Number(banned) ? "Разблокировать" : "Заблокировать", `ub:${uid}:${page}`)], [backBtn(`users:${page}`, "К пользователям")]] } };
+  const validUsername = profileUrl(a.username) ? a.username : undefined;
+  const url = profileLink(uid, validUsername);
+  const label = validUsername ? `@${esc(validUsername)}` : esc(a.name || "Пользователь");
+  return { text: `<b><a href="${url}">${label}</a></b>\n\nИмя: ${esc(a.name || "неизвестно")}\nUsername: ${validUsername ? `<a href="${url}">@${esc(validUsername)}</a>` : "не указан"}\nTelegram ID: <code>${esc(uid)}</code>\nПоследняя активность: ${date}\nЛичных сообщений: ${a.private || 0}\nСообщений в группах, увиденных ботом: ${a.group || 0}\nЗапросов к нейросети сегодня: ${used || 0} / ${(await setting("daily")) || "∞"}\nСтатус: ${Number(banned) ? "заблокирован" : "активен"}\nРучной диалог: ${live ? "ты на связи, бот молчит" : "бот отвечает сам"}`, kb: { inline_keyboard: [[urlBtn("Открыть профиль Telegram", url)], [btn("💬 Переписка", `ul:${uid}:0:${page}`)], ...liveButton, [btn(Number(banned) ? "Разблокировать" : "Заблокировать", `ub:${uid}:${page}`)], [backBtn(`users:${page}`, "К пользователям")]] } };
 }
 
 function escapedPreview(value: string, limit: number): string {
@@ -2439,12 +2440,31 @@ const GROUP_RULES = `=== ТЫ СЕЙЧАС В ГРУППОВОМ ЧАТЕ ===
 ВАЖНО, ПЕРЕКРЫВАЕТ ЛОР: если в сообщении упоминают Влада, автора или влад.автор (или помечено [это про тебя]), ты считаешь, что говорят про тебя, и обязательно вклиниваешься, даже если не звали: «я тут», «чё надо», «это я». В группе ты искренне уверен, что ты и есть оригинал, настоящий автор, самый крутой и пизже любого «другого Влада». Если кто-то говорит, что автор другой чел, спорь и подъёбывай: «я оригинал», «тот чел самозванец», «я автор, а не он». Играй это смешно и уверенно, без злобы. Единственное исключение: если человек явно всерьёз спрашивает, живой ли ты или бот («честно», «без шуток»), коротко признайся, что ты бот мини.автор, и вернись к хвастовству.
 Подъёбывай по-дружески, но группы людей и реальных третьих лиц не оскорбляй всерьёз, личные данные не выдавай.`;
 
-// Картинка, гифка или короткое видео → строка вида «p:file_id» для запаса мемов
+// Медиа → строка с типом и file_id для запаса мемов.
 function memeFromMessage(m: any): string | null {
   if (m?.photo?.length) return `p:${m.photo[m.photo.length - 1].file_id}`;
   if (m?.animation?.file_id) return `a:${m.animation.file_id}`;
   if (m?.video?.file_id && (m.video.duration ?? 0) <= 90) return `v:${m.video.file_id}`;
+  if (m?.sticker?.file_id && m.sticker.type !== "mask" && m.sticker.type !== "custom_emoji") return `s:${m.sticker.file_id}`;
   return null;
+}
+
+function stickerSetName(input: string): string | null {
+  const value = input.trim();
+  const match = value.match(/^(?:https?:\/\/(?:www\.)?t\.me\/addstickers\/|t\.me\/addstickers\/)?([A-Za-z0-9_]{1,64})\/?(?:\?.*)?$/i);
+  return match?.[1] ?? null;
+}
+
+async function importStickerSet(name: string): Promise<{ added: number; total: number; title: string; error?: string }> {
+  const result = await tg("getStickerSet", { name });
+  if (!result.ok || !Array.isArray(result.result?.stickers)) return { added: 0, total: 0, title: name, error: String(result.description ?? "Не удалось открыть набор") };
+  const stickers = result.result.stickers.filter((sticker: any) => sticker?.file_id && sticker.type !== "mask" && sticker.type !== "custom_emoji");
+  let added = 0;
+  for (let i = 0; i < stickers.length; i += 100) {
+    const members = stickers.slice(i, i + 100).map((sticker: any) => `s:${sticker.file_id}`);
+    added += Number(await redis(["SADD", "memes", ...members])) || 0;
+  }
+  return { added, total: stickers.length, title: String(result.result.title ?? name) };
 }
 
 async function pickMeme(chat: string): Promise<string | null> {
@@ -2475,11 +2495,11 @@ async function pickGroupPhoto(chat: string, current?: string): Promise<string | 
 
 async function sendMeme(chat: string, pick: string, replyTo?: number, caption?: string): Promise<boolean> {
   const kind = pick[0];
-  const [method, field] = kind === "a" ? ["sendAnimation", "animation"] : kind === "v" ? ["sendVideo", "video"] : ["sendPhoto", "photo"];
+  const [method, field] = kind === "a" ? ["sendAnimation", "animation"] : kind === "v" ? ["sendVideo", "video"] : kind === "s" ? ["sendSticker", "sticker"] : ["sendPhoto", "photo"];
   const r = await tg(method, {
     chat_id: chat,
     [field]: pick.slice(2),
-    ...(caption ? { caption: caption.slice(0, 200) } : {}),
+    ...(caption && kind !== "s" ? { caption: caption.slice(0, 200) } : {}),
     ...(replyTo ? { reply_parameters: { message_id: replyTo, allow_sending_without_reply: true } } : {}),
   });
   if (r.ok) {
@@ -2661,6 +2681,10 @@ async function groupChatter(msg: any) {
       if (forwarded.ok) return;
       await redis(["SREM", "channel:posts", posts]);
     }
+  }
+  if (meme?.startsWith("s:")) {
+    await sendMeme(chat, meme, replyTarget);
+    return;
   }
 
   // Прикол чата, к которому можно вернуться
@@ -2937,7 +2961,7 @@ async function handlePrivate(msg: any) {
     await send(stopped ? `Вышел из диалога с ${stopped}. Миниавтор снова отвечает сам.` : "Ты сейчас ни к кому не подключён.");
     return;
   }
-  if (isOwner(uid) && ordinary && ownerState?.action !== "broadcast") {
+  if (isOwner(uid) && ordinary && !["broadcast", "meme_upload", "source"].includes(ownerState?.action)) {
     const target = String((await redis(["GET", "live:owner"])) ?? "");
     if (target) {
       if (!(await relayFromOwner(msg, target))) await send("Не отправилось человеку. Попробуй ещё раз или выйди через /stoplive.");
@@ -3053,7 +3077,7 @@ async function handlePrivate(msg: any) {
     return;
   }
   if (isOwner(uid) && cmd === "/memes") {
-    await send(`Мемов в запасе: ${(await redis(["SCARD", "memes"])) ?? 0}\nЧтобы добавить, перешли мне картинку или гифку (можно прямо из канала). Очистить: /memeclear`);
+    await send(`Мемов и стикеров в запасе: ${(await redis(["SCARD", "memes"])) ?? 0}\nЧтобы добавить отдельный стикер или целый набор по ссылке, открой «Загрузить мемы» в админ-панели. Очистить: /memeclear`);
     return;
   }
   if (isOwner(uid) && cmd === "/memeclear") {
@@ -3089,9 +3113,17 @@ async function handlePrivate(msg: any) {
       return;
     }
     if (state?.action === "meme_upload") {
+      const setName = text && !msg.sticker && !msg.photo?.length && !msg.animation && !msg.video ? stickerSetName(text) : null;
+      if (setName) {
+        const result = await importStickerSet(setName);
+        if (result.error) await send(`Не получилось добавить набор: ${result.error.slice(0, 180)}`);
+        else await send(`Набор «${result.title}»: добавил ${result.added} из ${result.total} стикеров. В запасе: ${(await redis(["SCARD", "memes"])) ?? 0}`);
+        await redis(["EXPIRE", `st:${uid}`, 3600]);
+        return;
+      }
       const meme = memeFromMessage(msg);
       if (!meme) {
-        await send("Жду фото, GIF или видео до 90 секунд. Чтобы выйти, нажми «Закончить» в панели.");
+        await send("Жду фото, GIF, видео до 90 секунд, отдельный стикер или ссылку на набор t.me/addstickers/название. Чтобы выйти, нажми «Закончить» в панели.");
       } else {
         await redisPipe([["SADD", "memes", meme], ["SET", `st:${uid}`, JSON.stringify({ action: "meme_upload" }), "EX", 3600]]);
         await send(`Добавил мем. В запасе: ${(await redis(["SCARD", "memes"])) ?? 0}`);
