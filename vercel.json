@@ -3,5 +3,11 @@
     "api/webhook.ts": {
       "maxDuration": 30
     }
-  }
+  },
+  "crons": [
+    {
+      "path": "/api/webhook?cron=1",
+      "schedule": "0 6 * * *"
+    }
+  ]
 }
