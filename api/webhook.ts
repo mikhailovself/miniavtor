@@ -39,7 +39,7 @@ async function setting(key: Setting): Promise<number> {
   const value = Number(raw);
   return raw !== null && SETTINGS[key].some((n) => n === value)
     ? value
-    : key === "chatter" ? CHANCE : key === "meme" ? 0.1 : 0.05;
+    : key === "chatter" ? CHANCE : key === "meme" ? 0.3 : 0.05;
 }
 
 type Note = {
@@ -982,8 +982,9 @@ async function groupsView(): Promise<View> {
 
 async function adminView(): Promise<View> {
   const [chatter, meme, forward] = await Promise.all([setting("chatter"), setting("meme"), setting("forward")]);
+  const [stock, posts, last, seen] = await redisPipe([["SCARD", "memes"], ["SCARD", "channel:posts"], ["GET", "channel:last"], ["GET", "channel:seen"]]);
   return {
-    text: `<b>⚙️ Админ-панель</b>\n\nОтветы без обращения: ${Math.round(chatter * 100)}%\nМемы среди таких ответов: ${Math.round(meme * 100)}%\nПересылка поста канала: ${Math.round(forward * 100)}%\n\nНа @упоминание и ответ боту реагирую отдельно. Для обычных сообщений нужна отключённая приватность бота или права админа в группе.`,
+    text: `<b>⚙️ Админ-панель</b>\n\nОтветы без обращения: ${Math.round(chatter * 100)}%\nМемы среди таких ответов: ${Math.round(meme * 100)}%\nПересылка поста канала: ${Math.round(forward * 100)}%\n\nИсточник: ${esc(MEME_SRC)}\nМемов в запасе: ${stock ?? 0}\nПостов для пересылки: ${posts ?? 0}\nПоследний принятый пост: ${last ? esc(String(last)) : "нет"}\nПоследний увиденный канал: ${seen ? esc(String(seen)) : "нет"}\n\nНа @упоминание и ответ боту реагирую отдельно. Для обычных сообщений нужна отключённая приватность бота или права админа в группе.`,
     kb: { inline_keyboard: [
       [btn("Частота ответов", "as:chatter")],
       [btn("Частота мемов", "as:meme")],
@@ -1025,6 +1026,7 @@ async function groupView(id: string): Promise<View> {
     rows.push(LEVEL_KEYS.slice(i, i + 2).map((k) => btn(`${level === k ? "✓ " : ""}${LEVELS[k].label}`.slice(0, 60), `gl:${id}:${k}`)));
   }
   rows.push([backBtn("grs", "К группам")]);
+  rows.unshift([btn("Отправить пробный мем", `gm:${id}`)]);
   return {
     text:
       `<b>${esc(title || id)}</b>\n\nКак часто я болтаю: <b>${LEVELS[level].label}</b>\n\n` +
@@ -1140,7 +1142,7 @@ async function handleCallback(cb: any) {
       reply_markup: v.kb,
     });
 
-  if (["adm", "as", "av", "wh", "whset", "grs", "gv", "gl"].includes(action) && !isOwner(uid)) {
+  if (["adm", "as", "av", "wh", "whset", "grs", "gv", "gl", "gm"].includes(action) && !isOwner(uid)) {
     await ack();
     return;
   }
@@ -1219,6 +1221,12 @@ async function handleCallback(cb: any) {
       }
       await show(await groupView(arg1));
       break;
+    case "gm": {
+      const known = await redis(["SISMEMBER", "chats", arg1]);
+      const pick = Number(known) === 1 ? await pickMeme(arg1) : null;
+      toast = pick ? (await sendMeme(arg1, pick) ? "Мем отправлен" : "Не удалось отправить мем") : "Нет мемов или группы в списке";
+      break;
+    }
     case "author":
       await show(authorView());
       break;
@@ -1621,11 +1629,14 @@ async function groupChatter(msg: any) {
 async function handleChannelPost(post: any) {
   if (!REDIS_URL || !post?.chat) return;
   const c = post.chat;
+  await redis(["SET", "channel:seen", `${c.username ? `@${c.username}` : c.id} (${c.id})`]);
   const ok = /^-?\d+$/.test(MEME_SRC) ? String(c.id) === MEME_SRC : String(c.username ?? "").toLowerCase() === MEME_SRC;
   if (!ok) return;
   const meme = memeFromMessage(post);
   if (meme) await redis(["SADD", "memes", meme]);
-  if (meme && post.message_id) await redis(["SADD", "channel:posts", `${c.id}:${post.message_id}`]);
+  if (meme && post.message_id) {
+    await redisPipe([["SADD", "channel:posts", `${c.id}:${post.message_id}`], ["SET", "channel:last", `${c.username ? `@${c.username}` : c.id} #${post.message_id}`]]);
+  }
 }
 
 async function handleGroup(msg: any) {
