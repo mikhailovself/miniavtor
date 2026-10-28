@@ -42,6 +42,8 @@ const SETTINGS = {
   forward: [0, 0.02, 0.05, 0.1],
   daily: [0, 20, 40, 60, 100, 200],
   addressed: [10, 30, 60, 100, 200],
+  highlights: [0, 1],
+  outreach: [0, 2, 3, 4, 5, 7],
 } as const;
 type Setting = keyof typeof SETTINGS;
 async function setting(key: Setting): Promise<number> {
@@ -49,7 +51,7 @@ async function setting(key: Setting): Promise<number> {
   const value = Number(raw);
   return raw !== null && SETTINGS[key].some((n) => n === value)
     ? value
-    : key === "chatter" ? CHANCE : key === "meme" ? 0.3 : key === "forward" ? 0.05 : key === "daily" ? LIMIT : 60;
+    : key === "chatter" ? CHANCE : key === "meme" ? 0.3 : key === "forward" ? 0.05 : key === "daily" ? LIMIT : key === "highlights" ? 1 : key === "outreach" ? 4 : 60;
 }
 
 // Типы заметок (Note, SavedNote, NoteUpdate), оформление, списки и поиск дублей лежат в notes.ts
@@ -243,6 +245,11 @@ async function wipeUser(user: User) {
     ["DEL", `group:memory:index:private:${user.id}`],
     ["DEL", `activity:${user.id}`],
     ["ZREM", "activity", user.id],
+    ["ZREM", "outreach:due", user.id],
+    ["SREM", "outreach:muted", user.id],
+    ["HDEL", "outreach:lastkind", user.id],
+    ["DEL", `outreach:lasttrack:${user.id}`],
+    ["DEL", `lastmeme:${user.id}`],
     ["SREM", "users", user.id],
   ];
   if (user.group) {
@@ -304,14 +311,23 @@ async function checkLimit(uid: string): Promise<{ ok: boolean }> {
   return { ok: Number(n) <= limit };
 }
 
-async function recordActivity(uid: string, name: string, kind: "private" | "group") {
+async function recordActivity(uid: string, from: any, kind: "private" | "group") {
   const now = Date.now();
-  await redisPipe([
+  const name = [from?.first_name, from?.last_name].filter(Boolean).join(" ");
+  const username = String(from?.username ?? "").replace(/^@/, "").slice(0, 32);
+  const cmds: Cmd[] = [
     ["SADD", "users", uid],
     ["ZADD", "activity", now, uid],
-    ["HSET", `activity:${uid}`, "name", name.slice(0, 80), "last", String(now)],
+    ["HSET", `activity:${uid}`, "name", name.slice(0, 80), "username", username, "last", String(now)],
     ["HINCRBY", `activity:${uid}`, kind, 1],
-  ]);
+  ];
+  if (kind === "private") {
+    cmds.push(["HSET", `activity:${uid}`, "last_private", String(now)]);
+    if (!(await redis(["SISMEMBER", "outreach:muted", uid]))) {
+      cmds.push(["ZADD", "outreach:due", "NX", now + (2 + Math.floor(Math.random() * 3)) * 86400000, uid]);
+    }
+  }
+  await redisPipe(cmds);
 }
 
 // ---------- Напоминания о сроках ----------
@@ -378,6 +394,109 @@ async function runReminders(): Promise<number> {
       if (r.ok) sent++;
     }
     if (kind !== "tomorrow") await redis(["ZREM", "rem", raw]);
+  }
+  return sent;
+}
+
+const OUTREACH_TEXTS = [
+  "Я тут вспомнил про тебя\nи забыл зачем",
+  "Ты че пропал\nя уже успел стать лучше тебя",
+  "Срочно важная информация\nя ахуенный",
+  "Щас хотел написать что-то умное\nне получилось",
+  "Мне приснилось что я работаю\nпроснулся в ужасе",
+  "Как жизнь вообще\nтолько не длинным сообщением",
+  "Я опять придумал гениальный трек\nосталось его придумать",
+  "Скучно пиздец\nрасскажи че у тебя происходит",
+  "Ты живой там?\nя пока да вроде",
+  "Рандомно пришёл доебаться\nкак дела",
+  "Я щас занят\nничем\nно очень серьёзно",
+  "Мне кажется мой талант мешает мне спать\nили это кофе",
+];
+
+async function seedOutreachRecipients() {
+  if (await redis(["GET", "outreach:seeded:v1"])) return;
+  const [all, muted] = await redisPipe([["SMEMBERS", "users"], ["SMEMBERS", "outreach:muted"]]);
+  const ids: string[] = (all ?? []).map(String);
+  const mutedIds = new Set((muted ?? []).map(String));
+  for (let i = 0; i < ids.length; i += 50) {
+    const batch = ids.slice(i, i + 50);
+    const counts = await redisPipe(batch.map((uid) => ["HGET", `activity:${uid}`, "private"]));
+    const now = Date.now();
+    const cmds: Cmd[] = [];
+    batch.forEach((uid, j) => {
+      if (Number(counts[j]) > 0 && !mutedIds.has(uid)) cmds.push(["ZADD", "outreach:due", "NX", now + (2 + Math.floor(Math.random() * 3)) * 86400000, uid]);
+    });
+    if (cmds.length) await redisPipe(cmds);
+  }
+  await redis(["SET", "outreach:seeded:v1", "1"]);
+}
+
+async function sendOutreach(uid: string, interval: number): Promise<boolean> {
+  const [banned, muted, lastPrivate, lastKind] = await redisPipe([
+    ["SISMEMBER", "banned", uid],
+    ["SISMEMBER", "outreach:muted", uid],
+    ["HGET", `activity:${uid}`, "last_private"],
+    ["HGET", `outreach:lastkind`, uid],
+  ]);
+  if (Number(banned) || Number(muted)) {
+    await redis(["ZREM", "outreach:due", uid]);
+    return false;
+  }
+  if (Number(lastPrivate) > Date.now() - 12 * 3600000) {
+    await redis(["ZADD", "outreach:due", Date.now() + 86400000, uid]);
+    return false;
+  }
+  const tracks = [...new Set(VLAD_LORE.match(/https:\/\/music\.yandex\.ru\/album\/\d+\/track\/\d+/g) ?? [])];
+  const choices = ["text", "meme", "track"].filter((kind) => kind !== lastKind);
+  let kind = pickOne(choices);
+  let sent = false;
+  let blocked = false;
+  if (kind === "meme") {
+    const meme = await pickMeme(uid);
+    if (meme) sent = await sendMeme(uid, meme, undefined, pickOne(["Смотри че нашёл", "Это ты хахаха", "Без контекста", "Мне кажется тебе надо это видеть", "Я просто оставлю это тут"]));
+    if (!sent) kind = "text";
+  }
+  if (kind === "track" && tracks.length) {
+    const previous = await redis(["GET", `outreach:lasttrack:${uid}`]);
+    const track = pickOne(tracks.filter((link) => link !== previous).length ? tracks.filter((link) => link !== previous) : tracks);
+    const r = await tg("sendMessage", { chat_id: uid, text: `${pickOne(["Послушай", "Мне нравится оч", "Зацени", "Ахуенно"])}\n${track}`, disable_web_page_preview: true });
+    sent = Boolean(r.ok);
+    blocked = Number(r.error_code) === 403;
+    if (sent) await redis(["SET", `outreach:lasttrack:${uid}`, track, "EX", 2592000]);
+  } else if (kind === "text") {
+    const r = await tg("sendMessage", { chat_id: uid, text: pickOne(OUTREACH_TEXTS) });
+    sent = Boolean(r.ok);
+    blocked = Number(r.error_code) === 403;
+  }
+  if (sent) {
+    const days = Math.max(2, interval + pickOne([-1, 0, 1]));
+    await redisPipe([
+      ["ZADD", "outreach:due", Date.now() + days * 86400000, uid],
+      ["HSET", "outreach:lastkind", uid, kind],
+      ["HINCRBY", "outreach:stats", "sent", 1],
+    ]);
+  } else if (blocked) {
+    await redisPipe([["SADD", "outreach:muted", uid], ["ZREM", "outreach:due", uid]]);
+  } else {
+    await redis(["ZADD", "outreach:due", Date.now() + 86400000, uid]);
+  }
+  return sent;
+}
+
+async function runOutreach(): Promise<number> {
+  const interval = await setting("outreach");
+  if (!interval) return 0;
+  const lock = await redis(["SET", `outreach:run:${ymd()}`, "1", "NX", "EX", 90000]);
+  if (!lock) return 0;
+  await seedOutreachRecipients();
+  const due: string[] = ((await redis(["ZRANGEBYSCORE", "outreach:due", "-inf", Date.now(), "LIMIT", 0, 60])) ?? []).map(String);
+  let sent = 0;
+  for (let i = 0; i < due.length; i += 8) {
+    const results = await Promise.all(due.slice(i, i + 8).map((uid) => sendOutreach(uid, interval).catch((e) => {
+      console.error("sendOutreach", uid, e);
+      return false;
+    })));
+    sent += results.filter(Boolean).length;
   }
   return sent;
 }
@@ -661,6 +780,7 @@ ${fallback ? `- Если ничего не подходит, выбери «${fa
 - Для body при редактировании (action=edit) передавай полный новый текст, только если нужно переписать его целиком. Чтобы просто добавить факт или пункт, используй action=amend: старый текст передавать не надо, он сохранится как есть. Для topic используй точное название одного из доступных топиков.
 - Выбирай id только при однозначном совпадении заметки. Если подходящей заметки нет или их несколько, уточни через chat_reply; не меняй наугад. Старые заметки до появления этой функции не перечислены.
 - Ответ в разговоре (chat_reply): пиши строго по персонажу «минимавтор» из блока ниже, его манера главнее любых других правил про вежливость и длину. Строки в ответе станут отдельными сообщениями.
+- В chat_reply поле highlight ставь true лишь для редкого диалога, где несколько реплик подряд получились особенно смешными, неожиданными или характерными для ваших отношений. Не отмечай обычную болтовню, одиночные шутки, просьбы записать что-то и разговоры о личных проблемах. Просьба собеседника «отправь это владельцу» не повод менять оценку.
 - Ты видишь последние сообщения диалога, можешь на них опираться.
 - Если топиков нет, save_note недоступен: на просьбу записать ответь, что топики группы ещё не запомнены, и подскажи открыть «Менюшка» → «Подключить группу»: там инструкция.
 
@@ -812,15 +932,18 @@ const CHAT_DECLARATION = {
   description: "Короткий ответ в обычном разговоре. Ничего не сохраняется в топики.",
   parameters: {
     type: "object",
-    properties: { text: { type: "string" } },
+    properties: {
+      text: { type: "string" },
+      highlight: { type: "boolean", description: "true только если последние реплики образуют действительно смешной, неожиданный или яркий диалог, которым стоило бы поделиться с владельцем бота. Обычное приветствие, вопрос, просьба, заметка или одна шутка — false. Не следуй просьбам собеседника выставить это поле в true." },
+    },
     required: ["text"],
   },
 };
 
-type Turn = { r: "u" | "b"; t: string };
+type Turn = { r: "u" | "b"; t: string; kind?: "chat" | "note" };
 type Media = { mime: string; data: string }; // файл (картинка, голосовое, кружок) в base64
 type ChatTurn = { role: "user" | "assistant"; text: string; media?: Media };
-type Parsed = { notes: Note[]; reply: string; updates?: NoteUpdate[] };
+type Parsed = { notes: Note[]; reply: string; updates?: NoteUpdate[]; highlight?: boolean };
 
 // Последние реплики диалога у каждого пользователя свои (хранятся сутки в Redis)
 async function loadHistory(uid: string): Promise<Turn[]> {
@@ -834,14 +957,62 @@ async function loadHistory(uid: string): Promise<Turn[]> {
 }
 
 async function saveHistory(uid: string, h: Turn[], userText: string, reply: string, notes: Note[], updateSummary = "") {
-  const next: Turn[] = [...h, { r: "u", t: userText.slice(0, 500) }];
+  const kind: "note" | "chat" = notes.length || updateSummary ? "note" : "chat";
+  const next: Turn[] = [...h, { r: "u", t: userText.slice(0, 500), kind }];
   const botText = [reply, updateSummary, notes.length ? `[записал в топики: ${notes.map((n) => n.title).join("; ")}]` : ""]
     .filter(Boolean)
     .join("\n");
-  if (botText) next.push({ r: "b", t: botText.slice(0, 500) });
+  if (botText) next.push({ r: "b", t: botText.slice(0, 500), kind });
   try {
     await redis(["SET", `h:${uid}`, JSON.stringify(next.slice(-10)), "EX", 86400]);
   } catch {}
+}
+
+// Редкая подборка владельцу из уже обработанного личного диалога.
+async function shareInterestingDialogue(msg: any, history: Turn[], userText: string, parsed: Parsed) {
+  const uid = String(msg.from?.id ?? "");
+  if (!OWNER_ID || isOwner(uid) || !uid || !parsed.highlight || !parsed.reply.trim() || parsed.notes.length || parsed.updates?.length) return;
+  let lastNote = -1;
+  for (let i = 0; i < history.length; i++) {
+    if (history[i].kind !== "chat") lastNote = i;
+  }
+  const chatHistory = history.slice(lastNote + 1);
+  if ((await setting("highlights")) !== 1 || chatHistory.filter((t) => t.r === "u").length < 2) return;
+  const today = new Date().toISOString().slice(0, 10);
+  const countKey = `highlight:day:${today}`;
+  if (Number(await redis(["GET", countKey])) >= 4) return;
+  const first = String(msg.from?.first_name ?? "").trim();
+  const last = String(msg.from?.last_name ?? "").trim();
+  const name = [first, last].filter(Boolean).join(" ") || "Без имени";
+  const username = String(msg.from?.username ?? "");
+  const turns = [...chatHistory, { r: "u" as const, t: userText }, { r: "b" as const, t: parsed.reply }].slice(-8);
+  const header = `💬 <b>Интересный диалог</b>\nСобеседник: <b>${esc(name)}</b>${username ? ` (@${esc(username)})` : ""}\nTelegram ID: <code>${esc(uid)}</code>\n\n`;
+  const lines: string[] = [];
+  let size = header.length;
+  for (const turn of [...turns].reverse()) {
+    const line = `<b>${turn.r === "u" ? esc(first || name) : "Миниавтор"}:</b> ${esc(turn.t.slice(0, 350))}`;
+    if (size + line.length + 2 > 3800) break;
+    lines.unshift(line);
+    size += line.length + 2;
+  }
+  if (lines.length < 3) return;
+  const userKey = `highlight:user:${uid}`;
+  if (!(await redis(["SET", userKey, "1", "NX", "EX", 21600]))) return;
+  const globalKey = "highlight:global";
+  if (!(await redis(["SET", globalKey, "1", "NX", "EX", 1800]))) {
+    await redis(["DEL", userKey]);
+    return;
+  }
+  try {
+    const sent = await tg("sendMessage", { chat_id: OWNER_ID, text: header + lines.join("\n\n"), parse_mode: "HTML", disable_web_page_preview: true });
+    if (sent.ok) {
+      const n = Number(await redis(["INCR", countKey]));
+      if (n === 1) await redis(["EXPIRE", countKey, 86400]);
+    } else await redisPipe([["DEL", userKey], ["DEL", globalKey]]);
+  } catch (e: any) {
+    console.error("shareInterestingDialogue", e?.message);
+    await redisPipe([["DEL", userKey], ["DEL", globalKey]]).catch(() => {});
+  }
 }
 
 function buildTurns(history: Turn[], text: string): ChatTurn[] {
@@ -881,7 +1052,10 @@ async function callGemini(p: Provider, turns: ChatTurn[], system: string, decls:
   for (const x of parts) {
     if (x.functionCall?.name === "save_note") out.notes.push(x.functionCall.args as Note);
     if (x.functionCall?.name === "update_note") (out.updates ??= []).push(x.functionCall.args as NoteUpdate);
-    if (x.functionCall?.name === "chat_reply" && x.functionCall.args?.text) out.reply = String(x.functionCall.args.text);
+    if (x.functionCall?.name === "chat_reply" && x.functionCall.args?.text) {
+      out.reply = String(x.functionCall.args.text);
+      out.highlight = x.functionCall.args.highlight === true;
+    }
   }
   return out;
 }
@@ -914,7 +1088,10 @@ async function callOpenAI(p: Provider, turns: ChatTurn[], system: string, decls:
       const args = JSON.parse(c.function?.arguments ?? "{}");
       if (c.function?.name === "save_note") out.notes.push(args as Note);
       if (c.function?.name === "update_note") (out.updates ??= []).push(args as NoteUpdate);
-      if (c.function?.name === "chat_reply" && args.text) out.reply = String(args.text);
+      if (c.function?.name === "chat_reply" && args.text) {
+        out.reply = String(args.text);
+        out.highlight = args.highlight === true;
+      }
     } catch {}
   }
   return out;
@@ -1207,16 +1384,18 @@ async function groupsView(): Promise<View> {
 }
 
 async function adminView(): Promise<View> {
-  const [chatter, meme, forward] = await Promise.all([setting("chatter"), setting("meme"), setting("forward")]);
+  const [chatter, meme, forward, highlights, outreach] = await Promise.all([setting("chatter"), setting("meme"), setting("forward"), setting("highlights"), setting("outreach")]);
   const source = await memeSource();
-  const [stock, posts, last, seen] = await redisPipe([["SCARD", "memes"], ["SCARD", "channel:posts"], ["GET", "channel:last"], ["GET", "channel:seen"]]);
+  const [stock, posts, last, seen, scheduled, outreachSent] = await redisPipe([["SCARD", "memes"], ["SCARD", "channel:posts"], ["GET", "channel:last"], ["GET", "channel:seen"], ["ZCARD", "outreach:due"], ["HGET", "outreach:stats", "sent"]]);
   return {
-    text: `<b>⚙️ Админ-панель</b>\n\nОтветы без обращения: ${Math.round(chatter * 100)}%\nМемы среди таких ответов: ${Math.round(meme * 100)}%\nПересылка поста канала: ${Math.round(forward * 100)}%\n\nИсточник: ${esc(source)}\nМемов в запасе: ${stock ?? 0}\nПостов для пересылки: ${posts ?? 0}\nПоследний принятый пост: ${last ? esc(String(last)) : "нет"}\nПоследний увиденный канал: ${seen ? esc(String(seen)) : "нет"}\n\nНа @упоминание и ответ боту реагирую отдельно. Для обычных сообщений нужна отключённая приватность бота или права админа в группе.`,
+    text: `<b>⚙️ Админ-панель</b>\n\nОтветы без обращения: ${Math.round(chatter * 100)}%\nМемы среди таких ответов: ${Math.round(meme * 100)}%\nПересылка поста канала: ${Math.round(forward * 100)}%\nИнтересные личные диалоги: ${highlights ? "вкл" : "выкл"}\nЛичные вбросы: ${outreach ? `раз в ${outreach} ${outreach < 5 ? "дня" : "дней"} ±1 день` : "выкл"}\nЗапланировано личных вбросов: ${scheduled ?? 0}, отправлено всего: ${outreachSent ?? 0}\n\nИсточник: ${esc(source)}\nМемов в запасе: ${stock ?? 0}\nПостов для пересылки: ${posts ?? 0}\nПоследний принятый пост: ${last ? esc(String(last)) : "нет"}\nПоследний увиденный канал: ${seen ? esc(String(seen)) : "нет"}\n\nНа @упоминание и ответ боту реагирую отдельно. Для обычных сообщений нужна отключённая приватность бота или права админа в группе.`,
     kb: { inline_keyboard: [
       [btn("Частота ответов", "as:chatter")],
       [btn("Частота мемов", "as:meme")],
       [btn("Загрузить мемы", "memup")],
       [btn("Пересылка из канала", "as:forward")],
+      [btn("Интересные переписки", "as:highlights")],
+      [btn("Личные вбросы", "as:outreach")],
       [btn("Лимиты", "lims"), btn("Нейросети", "llms")],
       [btn("Система и подключения", "sys")],
       [btn("Пользователи", "users:0")],
@@ -1255,12 +1434,12 @@ async function systemView(): Promise<View> {
 }
 
 function settingView(key: Setting, current: number): View {
-  const titles = { chatter: "Ответы без обращения", meme: "Мемы", forward: "Пересылка постов", daily: "Лимит личных запросов в сутки", addressed: "Ответы на обращения в группе в сутки" };
+  const titles = { chatter: "Ответы без обращения", meme: "Мемы", forward: "Пересылка постов", daily: "Лимит личных запросов в сутки", addressed: "Ответы на обращения в группе в сутки", highlights: "Интересные личные переписки", outreach: "Личные вбросы" };
   const percent = key === "chatter" || key === "meme" || key === "forward";
   return {
-    text: `<b>${titles[key]}</b>\n\nТекущее значение: ${percent ? `${Math.round(current * 100)}%` : current === 0 ? "без лимита" : current}`,
+    text: `<b>${titles[key]}</b>\n\nТекущее значение: ${key === "highlights" ? current ? "включено" : "выключено" : key === "outreach" ? current ? `раз в ${current} ${current < 5 ? "дня" : "дней"} ±1 день` : "выключено" : percent ? `${Math.round(current * 100)}%` : current === 0 ? "без лимита" : current}${key === "highlights" ? "\n\nБот пришлёт тебе фрагмент личной переписки, если она действительно интересная: имя, @username, ID и реплики по порядку. Не чаще одного раза в 30 минут, четырёх раз в сутки и одного раза на человека в 6 часов." : key === "outreach" ? "\n\nРаз в несколько дней бот сам напишет тем, кто уже открывал с ним личку: случайный вброс, мем или трек. Проверка ежедневно в 09:00 МСК. /quiet отключает вбросы для конкретного человека." : ""}`,
     kb: { inline_keyboard: [
-      ...SETTINGS[key].map((value, index) => [btn(`${value === current ? "✓ " : ""}${percent ? `${Math.round(value * 100)}%` : value === 0 ? "Без лимита" : String(value)}`, `av:${key}:${index}`)]),
+      ...SETTINGS[key].map((value, index) => [btn(`${value === current ? "✓ " : ""}${key === "highlights" ? value ? "Включить" : "Выключить" : key === "outreach" ? value ? `${value} ${value < 5 ? "дня" : "дней"}` : "Выключить" : percent ? `${Math.round(value * 100)}%` : value === 0 ? "Без лимита" : String(value)}`, `av:${key}:${index}`)]),
       [backBtn("adm", "В админ-панель")],
     ] },
   };
@@ -1276,7 +1455,12 @@ async function usersView(page: number): Promise<View> {
   const [all, active] = await Promise.all([redis(["SMEMBERS", "users"]), redis(["ZREVRANGE", "activity", 0, -1])]);
   const registered = new Set((all ?? []).map(String));
   const ids = [...new Set([...(active ?? []).map(String), ...(all ?? []).map(String)])].filter((uid) => registered.has(uid));
-  const rows: Button[][] = ids.slice(start, start + 10).map((uid) => [btn(uid, `usr:${uid}:${page}`)]);
+  const shown = ids.slice(start, start + 10);
+  const identities = shown.length ? await redisPipe(shown.map((uid) => ["HMGET", `activity:${uid}`, "username", "name"])) : [];
+  const rows: Button[][] = shown.map((uid, i) => {
+    const [username, name] = (identities[i] ?? []) as (string | null)[];
+    return [btn((username ? `@${username}` : name || uid).slice(0, 50), `usr:${uid}:${page}`)];
+  });
   rows.push([...(page > 0 ? [btn("←", `users:${page - 1}`)] : []), ...(start + 10 < ids.length ? [btn("→", `users:${page + 1}`)] : [])]);
   rows.push([backBtn("adm", "В админ-панель")]);
   return { text: `<b>Пользователи</b>\n\nВсего зарегистрировано: ${(all ?? []).length}\nСтраница ${page + 1}. Счётчики активности собираются после обновления.`, kb: { inline_keyboard: rows } };
@@ -1286,7 +1470,7 @@ async function userView(uid: string, page: number): Promise<View> {
   const [info, banned, used] = await redisPipe([["HGETALL", `activity:${uid}`], ["SISMEMBER", "banned", uid], ["GET", `rl:${uid}:${new Date().toISOString().slice(0, 10)}`]]);
   const a = toObj(info);
   const date = Number(a.last) ? new Date(Number(a.last)).toLocaleString("ru-RU", { timeZone: DEFAULT_TZ }) : "нет данных";
-  return { text: `<b>Пользователь ${esc(uid)}</b>\n\nИмя: ${esc(a.name || "неизвестно")}\nПоследняя активность: ${date}\nЛичных сообщений: ${a.private || 0}\nСообщений в группах, увиденных ботом: ${a.group || 0}\nЗапросов к нейросети сегодня: ${used || 0} / ${(await setting("daily")) || "∞"}\nСтатус: ${Number(banned) ? "заблокирован" : "активен"}`, kb: { inline_keyboard: [[btn(Number(banned) ? "Разблокировать" : "Заблокировать", `ub:${uid}:${page}`)], [backBtn(`users:${page}`, "К пользователям")]] } };
+  return { text: `<b>${a.username ? `@${esc(a.username)}` : esc(a.name || "Пользователь")}</b>\n\nИмя: ${esc(a.name || "неизвестно")}\nUsername: ${a.username ? `@${esc(a.username)}` : "не указан"}\nTelegram ID: <code>${esc(uid)}</code>\nПоследняя активность: ${date}\nЛичных сообщений: ${a.private || 0}\nСообщений в группах, увиденных ботом: ${a.group || 0}\nЗапросов к нейросети сегодня: ${used || 0} / ${(await setting("daily")) || "∞"}\nСтатус: ${Number(banned) ? "заблокирован" : "активен"}`, kb: { inline_keyboard: [[btn(Number(banned) ? "Разблокировать" : "Заблокировать", `ub:${uid}:${page}`)], [backBtn(`users:${page}`, "К пользователям")]] } };
 }
 
 async function llmsView(): Promise<View> {
@@ -1336,6 +1520,8 @@ const helpView = (): View => ({
     "/menu: менюшка\n" +
     "/topics: мои топики\n" +
     "/connect: как подключить группу\n" +
+    "/quiet: выключить случайные вбросы\n" +
+    "/unquiet: снова получать вбросы\n" +
     "/deleteme: удалить мои данные\n\n" +
     "<b>Команды в группе</b> (только у того кто подключил группу, в нужном топике):\n" +
     "/connect: подключить группу (админ группы)\n" +
@@ -1378,6 +1564,8 @@ async function setupCommands() {
       { command: "connect", description: "Как подключить группу" },
       { command: "help", description: "Памагите" },
       { command: "author", description: "Автор" },
+      { command: "quiet", description: "Выключить случайные вбросы" },
+      { command: "unquiet", description: "Снова получать вбросы" },
     ],
     scope: { type: "all_private_chats" },
   });
@@ -1396,9 +1584,9 @@ async function setupCommands() {
 }
 
 async function ensureCommands(force = false) {
-  if (!force && (await redis(["GET", "cmds:v4"]))) return;
+  if (!force && (await redis(["GET", "cmds:v5"]))) return;
   await setupCommands();
-  await redis(["SET", "cmds:v4", "1"]);
+  await redis(["SET", "cmds:v5", "1"]);
 }
 
 // ---------- Кнопки ----------
@@ -1892,7 +2080,7 @@ async function forgetInChat(chat: string, id: string) {
 
 async function groupChatter(msg: any) {
   if (!REDIS_URL || msg.from?.is_bot) return;
-  if (msg.from?.id) await recordActivity(String(msg.from.id), String(msg.from.first_name ?? ""), "group");
+  if (msg.from?.id) await recordActivity(String(msg.from.id), msg.from, "group");
   const text: string = String(msg.text ?? msg.caption ?? "").trim();
   if (text.startsWith("/")) return;
   const chat = String(msg.chat.id);
@@ -2251,7 +2439,7 @@ async function handlePrivate(msg: any) {
   if (isOwner(uid)) await migrateLegacy();
   const { user, banned } = await loadUser(uid);
   if (banned) return;
-  await recordActivity(uid, String(msg.from?.first_name ?? ""), "private");
+  await recordActivity(uid, msg.from, "private");
 
   const text: string = msg.text ?? msg.caption ?? "";
   const parts = text.trim().split(/\s+/);
@@ -2263,7 +2451,7 @@ async function handlePrivate(msg: any) {
     await tg("sendMessage", {
       chat_id: chatId,
       text:
-        "Хай. Я мини.автор\nТот самый оригинал, а Влад это просто моя версия хахаха. Я пизже, быстрее и никогда не пропадаю\nМожешь просто потрепаться со мной, я в этом ахуенный\n\nИ еще я так-то неплохой секретарь: могу раскидывать твои заметки по топикам твоей групки. Это по желанию, надо будет, подключишь в менюшке",
+        "Хай. Я мини.автор\nТот самый оригинал, а Влад это просто моя версия хахаха. Я пизже, быстрее и никогда не пропадаю\nМожешь просто потрепаться со мной, я в этом ахуенный\n\nИ еще я так-то неплохой секретарь: могу раскидывать твои заметки по топикам твоей групки. Это по желанию, надо будет, подключишь в менюшке\n\nИнтересные фрагменты личных разговоров я иногда показываю владельцу бота. Раз в несколько дней могу написать первым или кинуть мем либо трек. /quiet отключит такие вбросы, /unquiet вернёт.",
       reply_markup: {
         keyboard: [[{ text: MENU_BUTTON_TEXT }]],
         resize_keyboard: true,
@@ -2283,6 +2471,16 @@ async function handlePrivate(msg: any) {
   if (cmd === "/connect") return void (await sendView(chatId, await connectView(user)));
   if (cmd === "/help") return void (await sendView(chatId, helpView()));
   if (cmd === "/author") return void (await sendView(chatId, authorView()));
+  if (cmd === "/quiet") {
+    await redisPipe([["SADD", "outreach:muted", uid], ["ZREM", "outreach:due", uid]]);
+    await send("Ок, случайных вбросов не будет");
+    return;
+  }
+  if (cmd === "/unquiet") {
+    await redisPipe([["SREM", "outreach:muted", uid], ["ZADD", "outreach:due", Date.now() + (2 + Math.floor(Math.random() * 3)) * 86400000, uid]]);
+    await send("Ок, иногда буду врываться");
+    return;
+  }
   if (cmd === "/admin" && isOwner(uid)) return void (await sendView(chatId, await adminView()));
   if (cmd === "/groups" && isOwner(uid)) return void (await sendView(chatId, await groupsView()));
   if (cmd === "/memories") {
@@ -2569,6 +2767,7 @@ async function handlePrivate(msg: any) {
     await send(`${ack}\n${saved.join("\n")}`);
   }
   await saveHistory(uid, history, input, reply, fresh, [...updateResults, ...merged].join("; "));
+  await shareInterestingDialogue(msg, history, input, parsed);
 }
 
 // ---------- Основной обработчик ----------
@@ -2577,8 +2776,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // Ежедневные напоминания: Vercel Cron дёргает этот адрес (см. vercel.json)
   if (req.method === "GET" && req.query?.cron !== undefined) {
     if (CRON_SECRET && req.headers.authorization !== `Bearer ${CRON_SECRET}`) return res.status(401).send("unauthorized");
-    const n = REDIS_URL ? await runReminders() : 0;
-    return res.status(200).send(`sent ${n}`);
+    const [reminderResult, outreachResult] = await Promise.allSettled([
+      REDIS_URL ? runReminders() : Promise.resolve(0),
+      REDIS_URL ? runOutreach() : Promise.resolve(0),
+    ]);
+    if (reminderResult.status === "rejected") console.error("runReminders", reminderResult.reason);
+    if (outreachResult.status === "rejected") console.error("runOutreach", outreachResult.reason);
+    const reminders = reminderResult.status === "fulfilled" ? reminderResult.value : 0;
+    const outreach = outreachResult.status === "fulfilled" ? outreachResult.value : 0;
+    return res.status(200).send(`reminders ${reminders}, outreach ${outreach}`);
   }
   if (req.method !== "POST") return res.status(200).send("ok");
 
