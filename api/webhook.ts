@@ -288,6 +288,7 @@ async function wipeUser(user: User) {
     ["DEL", `group:memory:private:${user.id}`],
     ["DEL", `group:memory:index:private:${user.id}`],
     ["DEL", `outreach:topics:${user.id}`],
+    ["SREM", "reminders:muted", user.id],
     ["DEL", `activity:${user.id}`],
     ["ZREM", "activity", user.id],
     ["ZREM", "outreach:due", user.id],
@@ -557,6 +558,10 @@ async function runReminders(): Promise<{ sent: number; errors: number }> {
       it = JSON.parse(raw);
     } catch {
       await redis(["ZREM", "rem", raw]);
+      continue;
+    }
+    if (Number(await redis(["SISMEMBER", "reminders:muted", it.u]))) {
+      if (it.d <= today) await redis(["ZREM", "rem", raw]);
       continue;
     }
     const kind = it.d < today ? "late" : it.d === today ? "today" : "tomorrow";
@@ -1579,11 +1584,28 @@ async function mainView(user: User): Promise<View> {
         [btn("👥 Добавить в группу", "groupadd")],
         [btn("🗂 автор.секретарь", "secretary")],
         [btn("🎤 автор.создатель", "author")],
+        [btn("⚙️ Для себя", "personal")],
         ...(liveTarget ? [[btn("⏹ Выйти из ручного диалога", `ld:${liveTarget}:0`)]] : []),
         ...(isOwner(user.id) ? [[btn("⚙️ Админ-панель", "adm")]] : []),
       ],
     },
   };
+}
+
+async function personalView(uid: string): Promise<View> {
+  const [quiet, muted] = await redisPipe([["SISMEMBER", "outreach:muted", uid], ["SISMEMBER", "reminders:muted", uid]]);
+  return { text: "<b>⚙️ Для себя</b>\n\nВыбирай, что настроить 👇\n\nНапоминания проверяю раз в день. Пока они выключены, пропущенные напоминания не отправляются.", kb: { inline_keyboard: [
+    [btn(`💬 Личные вбросы: ${Number(quiet) ? "выкл" : "вкл"}`, "personalout")],
+    [btn(`⏰ Напоминания: ${Number(muted) ? "выкл" : "вкл"}`, "personalrem")],
+    [btn("🧠 Что я запомнил", "personalmem")],
+    [btn("🗑 Удалить мои данные", "del")],
+    [backBtn()],
+  ] } };
+}
+
+async function personalMemoryView(uid: string): Promise<View> {
+  const memories = await chatMemories(`private:${uid}`);
+  return { text: `<b>🧠 Что я запомнил</b>\n\n${memories.length ? memories.map((m, i) => `${i + 1}. ${esc(m.text)}`).join("\n").slice(0, 3000) : "Пока ничего не запомнил"}\n\nЧтобы забыть факт, нажми на него ниже.`, kb: { inline_keyboard: [...memories.map((m, i) => [btn(`🗑 ${i + 1}. ${m.text}`.slice(0, 55), `pmforget:${m.id}`)]), [backBtn("personal")]] } };
 }
 
 const abilitiesView = (): View => ({
@@ -2109,6 +2131,29 @@ async function handleCallback(cb: any) {
   let toast: string | undefined;
 
   switch (action) {
+    case "personal":
+      await show(await personalView(uid));
+      break;
+    case "personalout": {
+      const muted = Number(await redis(["SISMEMBER", "outreach:muted", uid]));
+      if (muted) await redisPipe([["SREM", "outreach:muted", uid], ["ZADD", "outreach:due", Date.now() + (2 + Math.floor(Math.random() * 3)) * 86400000, uid]]);
+      else await redisPipe([["SADD", "outreach:muted", uid], ["ZREM", "outreach:due", uid]]);
+      await show(await personalView(uid));
+      break;
+    }
+    case "personalrem": {
+      const muted = Number(await redis(["SISMEMBER", "reminders:muted", uid]));
+      await redis([muted ? "SREM" : "SADD", "reminders:muted", uid]);
+      await show(await personalView(uid));
+      break;
+    }
+    case "personalmem":
+      await show(await personalMemoryView(uid));
+      break;
+    case "pmforget":
+      if (/^\d+$/.test(arg1 ?? "")) await forgetInChat(`private:${uid}`, arg1);
+      await show(await personalMemoryView(uid));
+      break;
     case "menu":
       await show(await mainView(user));
       break;
