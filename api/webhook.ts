@@ -489,7 +489,10 @@ async function runBroadcast(maxMs = 15000): Promise<void> {
         break;
       }
       await redis(["HINCRBY", "broadcast:active", result.ok ? "sent" : "failed", 1]);
-      if (!result.ok) await redis(["HSET", "broadcast:active", "last_error", String(result.description ?? "Telegram").slice(0, 160)]);
+      if (!result.ok) {
+        const error = String(result.description ?? "Telegram").slice(0, 160);
+        await redisPipe([["HSET", "broadcast:active", "last_error", error], ["HSET", "broadcast:failures", uid, error]]);
+      } else await redis(["HDEL", "broadcast:failures", uid]);
       await new Promise((resolve) => setTimeout(resolve, 45));
     }
     if (Number(await redis(["LLEN", "broadcast:queue"])) === 0) {
@@ -1754,11 +1757,19 @@ async function adminView(): Promise<View> {
 async function broadcastView(): Promise<View> {
   const a = toObj(await redis(["HGETALL", "broadcast:active"]));
   const pending = Number(await redis(["LLEN", "broadcast:queue"])) || 0;
+  const failures = toObj(await redis(["HGETALL", "broadcast:failures"]));
+  const entries = Object.entries(failures).slice(0, 15);
+  const profiles = entries.length ? await redisPipe(entries.map(([uid]) => ["HGETALL", `activity:${uid}`])) : [];
+  const detail = entries.map(([uid, error], i) => {
+    const p = toObj(profiles[i]);
+    const name = p.username ? `@${p.username}` : p.name || uid;
+    return `• ${esc(name)} (${esc(uid)}): ${esc(error)}`;
+  }).join("\n");
   if (a.id) {
     const done = a.status === "done";
     return {
-      text: `<b>📣 Рассылка</b>\n\n${done ? "Завершена" : "Идёт отправка"}. Всего: ${a.total || 0}; доставлено: ${a.sent || 0}; ошибок: ${a.failed || 0}; пропущено: ${a.skipped || 0}; осталось: ${pending}.${a.last_error ? `\nПоследняя ошибка: ${esc(a.last_error)}` : ""}\n\nСообщение отправляется только людям, которые уже писали боту в личку.`,
-      kb: { inline_keyboard: [...(!done ? [[btn("▶️ Продолжить сейчас", "brun"), btn("⏹ Остановить", "bstop")]] : [[btn("Новая рассылка", "bnew")]]), [backBtn("adm", "В админ-панель")]] },
+      text: `<b>📣 Рассылка</b>\n\n${done ? "Завершена" : "Идёт отправка"}. Всего: ${a.total || 0}; принято Telegram: ${a.sent || 0}; ошибок: ${a.failed || 0}; пропущено: ${a.skipped || 0}; осталось: ${pending}.${a.last_error ? `\nПоследняя ошибка: ${esc(a.last_error)}` : ""}${detail ? `\n\nНе отправлено:\n${detail}${Object.keys(failures).length > entries.length ? `\nПоказаны первые ${entries.length} из ${Object.keys(failures).length}` : ""}` : ""}\n\nСообщение отправляется только людям, которые уже писали боту в личку. Если бот заблокирован, повтор не поможет, пока человек его не разблокирует.`,
+      kb: { inline_keyboard: [...(!done ? [[btn("▶️ Продолжить сейчас", "brun"), btn("⏹ Остановить", "bstop")]] : [...(entries.length ? [[btn("🔁 Повторить ошибки", "bretry")]] : []), [btn("Новая рассылка", "bnew")]]), [backBtn("adm", "В админ-панель")]] },
     };
   }
   return { text: "<b>📣 Рассылка</b>\n\nОтправлю одно твоё сообщение всем, кто уже писал боту в личку. Поддерживаются текст, фото, GIF, видео и другие сообщения Telegram. Сначала покажу превью и число получателей, затем попрошу подтвердить. Отправка идёт пачками, прогресс виден здесь.", kb: { inline_keyboard: [[btn("Написать сообщение", "bnew")], [backBtn("adm", "В админ-панель")]] } };
@@ -2115,7 +2126,7 @@ async function handleCallback(cb: any) {
       reply_markup: v.kb,
     });
 
-  if (["adm", "as", "av", "wh", "whset", "grs", "gv", "gl", "gm", "gp", "lims", "llms", "users", "usr", "ul", "um", "ub", "lc", "ld", "src", "memup", "sys", "cr", "crun", "hf", "bf", "bad", "bview", "bnew", "bgo", "brun", "bstop"].includes(action) && !isOwner(uid)) {
+  if (["adm", "as", "av", "wh", "whset", "grs", "gv", "gl", "gm", "gp", "lims", "llms", "users", "usr", "ul", "um", "ub", "lc", "ld", "src", "memup", "sys", "cr", "crun", "hf", "bf", "bad", "bview", "bnew", "bgo", "brun", "bretry", "bstop"].includes(action) && !isOwner(uid)) {
     await ack();
     return;
   }
@@ -2205,6 +2216,7 @@ async function handleCallback(cb: any) {
       await ack("Рассылка началась");
       const recipients = await broadcastRecipients();
       await redis(["DEL", "broadcast:queue"]);
+      await redis(["DEL", "broadcast:failures"]);
       for (let i = 0; i < recipients.length; i += 100) await redis(["RPUSH", "broadcast:queue", ...recipients.slice(i, i + 100)]);
       await redis(["HSET", "broadcast:active", "id", String(draft.id), "message_id", String(draft.message_id), "status", "sending", "total", String(recipients.length), "sent", "0", "failed", "0", "skipped", "0", "last_error", ""]);
       await redis(["DEL", "broadcast:draft"]);
@@ -2217,6 +2229,18 @@ async function handleCallback(cb: any) {
       await runBroadcast();
       await show(await broadcastView());
       return;
+    case "bretry": {
+      const script = `if redis.call('HGET', KEYS[1], 'status') ~= 'done' or redis.call('EXISTS', KEYS[4]) == 1 then return 0 end
+        local ids = redis.call('HKEYS', KEYS[2]); if #ids == 0 then return 0 end
+        redis.call('DEL', KEYS[3]); for _, id in ipairs(ids) do redis.call('RPUSH', KEYS[3], id) end
+        redis.call('DEL', KEYS[2]); redis.call('HSET', KEYS[1], 'status', 'sending', 'failed', '0', 'last_error', ''); return #ids`;
+      const count = Number(await redis(["EVAL", script, 4, "broadcast:active", "broadcast:failures", "broadcast:queue", "broadcast:lock"]));
+      if (!count) { toast = "Нет ошибок для повтора или рассылка уже идёт"; await show(await broadcastView()); break; }
+      await ack(`Повторяю: ${count}`);
+      await runBroadcast();
+      await show(await broadcastView());
+      return;
+    }
     case "bstop":
       if (await redis(["GET", "broadcast:lock"])) { toast = "Пачка ещё отправляется, попробуй через несколько секунд"; break; }
       await redisPipe([["DEL", "broadcast:queue"], ["HSET", "broadcast:active", "status", "done", "finished", String(Date.now())]]);
