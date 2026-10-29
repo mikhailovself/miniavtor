@@ -43,6 +43,7 @@ test("owner joins one dialog, replies to its user and leaves", async () => {
   assert.equal(await f.startLive("123"), true);
   assert.equal(f.keys.get("live:owner"), "123");
   assert.equal(f.keys.get("live:user:123"), "1");
+  assert.equal(f.sent.some((item) => item.method === "sendMessage" && item.payload.chat_id === "123"), false);
 
   assert.equal(await f.relayFromOwner({ message_id: 77, text: "Привет лично" }, "123"), true);
   const copy = f.sent.find((item) => item.method === "copyMessage");
@@ -53,4 +54,5 @@ test("owner joins one dialog, replies to its user and leaves", async () => {
   assert.equal(await f.stopLive(), "123");
   assert.equal(f.keys.has("live:owner"), false);
   assert.equal(f.keys.has("live:user:123"), false);
+  assert.equal(f.sent.some((item) => item.method === "sendMessage" && item.payload.chat_id === "123"), false);
 });

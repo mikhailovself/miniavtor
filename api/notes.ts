@@ -19,6 +19,7 @@ export type Note = {
 export type SavedNote = { id: string; chat: string; thread: number; message: number; photo: boolean; note: Note; ts?: number };
 
 export type NoteUpdate = {
+  items?: ListItem[];
   id: string;
   // amend: точечно дополнить заметку или список (add_*, check_*, remove_*), не переписывая остальное
   action: "edit" | "paid" | "delete" | "watched" | "done" | "amend";
@@ -82,8 +83,7 @@ function isRedundant(text: string, others: string[]): boolean {
     const k = normText(o);
     if (!k) return false;
     if (k === key) return true;
-    const ov = overlap(text, o);
-    return ov.dice >= 0.85 || (ov.contain === 1 && ov.matched >= 1 && words(text).length <= words(o).length);
+    return false; // Похожие строки могут содержать разные условия и отрицания.
   });
 }
 
@@ -97,7 +97,7 @@ export function strList(v: unknown, maxN = 20, maxLen = 200): string[] {
 }
 
 const cleanItemText = (s: unknown, max = 120) => String(s ?? "").replace(BULLET, "").replace(/\s+/g, " ").trim().slice(0, max);
-const sameItem = (a: string, b: string) => normText(a) === normText(b) || overlap(a, b).dice >= 0.8;
+const sameItem = (a: string, b: string) => normText(a) === normText(b);
 
 export function uniqueItems(list: unknown, max = 60): ListItem[] {
   const raw: unknown[] = Array.isArray(list) ? list : typeof list === "string" ? list.split(/\n|;/) : [];
@@ -150,16 +150,9 @@ function cloneNote(n: Note): Note {
   return c;
 }
 
-function formatLength(n: Note): number {
-  return formatNote(n).length;
-}
-
-// Заметка должна поместиться в одно сообщение Telegram
-export function fitNote(note: Note, max = MAX_TEXT): Note {
-  const n = cloneNote(note);
-  while (formatLength(n) > max && n.items && n.items.length > 1) n.items.pop();
-  if (formatLength(n) > max) n.body = n.body.slice(0, Math.max(0, n.body.length - (formatLength(n) - max) - 3)).trimEnd();
-  return n;
+// Длину проверяет отправитель: нельзя молча удалять пункты ради лимита.
+export function fitNote(note: Note): Note {
+  return cloneNote(note);
 }
 
 // Приводит то, что вернула нейросеть, к аккуратной заметке: чистит пустое, повторы и мусорные поля
@@ -195,29 +188,31 @@ export function cleanNote(raw: any): Note | null {
 export function formatNote(n: Note): string {
   const total = n.items?.length ?? 0;
   const done = n.items?.filter((i) => i.done).length ?? 0;
-  const lines: string[] = [`${safeEmoji(n.emoji)} <b>${esc(n.title)}</b>${total && done ? ` <i>${done}/${total}</i>` : ""}`, ""];
+  const lines: string[] = [`${safeEmoji(n.emoji)} <b>${esc(n.title)}</b>`];
+  if (total) lines.push(`<i>Выполнено: ${done} из ${total}</i>`);
+  lines.push("");
 
   if (n.who || n.amount) {
-    const who = n.who ? esc(n.who) : "?";
+    const who = n.who ? esc(n.who) : "";
     const amount = n.amount ? esc(n.amount) : "";
-    lines.push(n.direction === "i_owe" ? `Ты должен: <b>${who}</b>, ${amount}` : `<b>${who}</b> должен тебе ${amount}`);
+    if (n.direction) lines.push(n.direction === "i_owe" ? "💸 Я должен" : "💰 Мне должны");
+    if (who) lines.push(`${n.direction === "i_owe" ? "Кому" : "Кто"}: <b>${who}</b>`);
+    if (amount) lines.push(`Сумма: <b>${amount}</b>`);
   }
 
-  const whoKey = normText(String(n.who ?? ""));
-  const amountKey = String(n.amount ?? "").replace(/\D/g, "");
-  const bodyLines = tidyLines(String(n.body ?? "").split(/\n+/), [n.title, `${n.who ?? ""} ${n.amount ?? ""}`, ...(n.items ?? []).map((i) => i.text)]).filter((x) => {
-    const key = normText(x);
-    const onlyDebt = whoKey && amountKey && key.includes(whoKey) && key.replace(/\D/g, "").includes(amountKey) && key.split(" ").length <= 9;
-    return !onlyDebt;
-  });
-  if (bodyLines.length) lines.push(esc(bodyLines.join("\n")));
+  const bodyLines = tidyLines(String(n.body ?? "").split(/\n+/), [n.title, ...(n.items ?? []).map((i) => i.text)]);
+  if (bodyLines.length) {
+    if (n.who || n.amount) lines.push("");
+    lines.push(esc(bodyLines.join("\n")));
+  }
 
   if (n.items?.length) {
     if (bodyLines.length) lines.push("");
     for (const it of n.items) lines.push(it.done ? `✅ <s>${esc(it.text)}</s>` : `⬜ ${esc(it.text)}`);
   }
-  if (n.deadline) lines.push("", `📅 До: ${esc(n.deadline)}`);
-  if (n.tags?.length) lines.push("", n.tags.map((t) => `#${esc(t.replace(/\s+/g, "_").replace(/^#/, ""))}`).join(" "));
+  if (n.deadline) lines.push("", `📅 Дата: ${esc(n.deadline.replace(/^(\d{4})-(\d{2})-(\d{2})$/, "$3.$2.$1"))}`);
+  const tags = [...new Set((n.tags ?? []).map(t => t.trim().replace(/^#+/, "").replace(/[^\p{L}\p{N}_]+/gu, "_").replace(/^_+|_+$/g, "").toLowerCase()).filter(Boolean))];
+  if (tags.length) lines.push("", tags.map(t => `#${esc(t)}`).join(" "));
   return lines.join("\n").trimEnd();
 }
 
