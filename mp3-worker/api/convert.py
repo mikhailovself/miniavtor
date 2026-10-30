@@ -5,13 +5,17 @@ from urllib.parse import urlparse, parse_qs
 from urllib.request import Request, urlopen
 import base64
 import binascii
+import hashlib
+import io
 import logging
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
 import uuid
+import zipfile
 
 import imageio_ffmpeg
 import numpy as np
@@ -53,8 +57,6 @@ def load_youtube_cookies(temp):
 
 
 def javascript_runtime():
-    # Vercel installs Python packages under _vendor and may omit the script
-    # directory where the deno PyPI wheel places its executable.
     deno_path = shutil.which("deno")
     if deno_path:
         logging.warning("YouTube JS runtime: deno found")
@@ -65,8 +67,32 @@ def javascript_runtime():
         if int(version.lstrip("v").split(".")[0]) >= 22:
             logging.warning("YouTube JS runtime: node %s found", version)
             return {"node": {"path": node_path}}
-    logging.error("YouTube JS runtime: neither Deno nor Node 22+ is available in Vercel function")
-    raise RuntimeError("No supported JavaScript runtime available")
+    # Python Functions do not include the script from the deno PyPI wheel.
+    # Fetch the pinned official Deno release only on a cold start and verify it.
+    machine = platform.machine().lower()
+    arch = {"x86_64": "x86_64", "amd64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}.get(machine)
+    if not arch or platform.system() != "Linux":
+        raise RuntimeError("No supported JavaScript runtime available")
+    target = Path(f"/tmp/miniavtor-deno-2.9.8-{arch}")
+    if not target.is_file():
+        base = "https://github.com/denoland/deno/releases/download/v2.9.8/"
+        name = f"deno-{arch}-unknown-linux-gnu.zip"
+        with urlopen(base + name + ".sha256sum", timeout=30) as response:
+            checksum = response.read(512).decode().split()[0]
+        with urlopen(base + name, timeout=90) as response:
+            archive = response.read(80 * 1024 * 1024 + 1)
+        if len(archive) > 80 * 1024 * 1024 or hashlib.sha256(archive).hexdigest() != checksum:
+            raise RuntimeError("Deno archive checksum mismatch")
+        with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+            if bundle.getinfo("deno").file_size > 250 * 1024 * 1024:
+                raise RuntimeError("Deno binary exceeds size limit")
+            binary = bundle.read("deno")
+        temporary = target.with_name(target.name + "-" + uuid.uuid4().hex)
+        temporary.write_bytes(binary)
+        temporary.chmod(0o700)
+        os.replace(temporary, target)
+    logging.warning("YouTube JS runtime: official Deno 2.9.8 ready")
+    return {"deno": {"path": str(target)}}
 
 
 def valid_youtube_url(raw):
