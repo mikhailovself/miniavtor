@@ -374,11 +374,12 @@ def convert(url, chat_id, status_message_id=None):
         set_mp3_tags(mp3, ffmpeg, title)
         if mp3.stat().st_size > MAX_BYTES:
             raise BeatInputError("MP3 получился слишком большим для Telegram.")
-        copy_line = f"{bpm or '?'} BPM | {key}"
+        # Две отдельные code-сущности: по тапу копируется либо BPM, либо тональность, а «|» не копируется.
+        copy_line = f"<code>{bpm or '?'} BPM</code> | <code>{key}</code>"
         update_progress(chat_id, status_message_id, beat_progress(3, "📤 Отправляю MP3"))
         telegram("sendAudio", {
             "chat_id": str(chat_id), "title": title, "performer": "@mini_avtor_bot",
-            "caption": f"<code>{copy_line}</code>", "parse_mode": "HTML",
+            "caption": copy_line, "parse_mode": "HTML",
         }, mp3)
         if status_message_id:
             try:
