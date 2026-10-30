@@ -21,6 +21,28 @@ os.environ.setdefault("NUMBA_CACHE_DIR", str(Path(gettempdir()) / "miniavtor-num
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 import imageio_ffmpeg
+import lazy_loader
+
+# Vercel's Python bundler omits .pyi files from some installed packages.
+# librosa uses four such stubs at runtime to set up lazy imports. Keep the
+# import map from the pinned wheel as a small worker asset instead.
+_original_attach_stub = lazy_loader.attach_stub
+_librosa_import_map = Path(__file__).resolve().parent.parent / "assets" / "librosa_lazy_imports.json"
+
+
+def _attach_librosa_stub(package_name, filename):
+    stub_path = Path(filename).with_suffix(".pyi")
+    if stub_path.is_file() or not package_name.startswith("librosa"):
+        return _original_attach_stub(package_name, filename)
+    with _librosa_import_map.open(encoding="utf-8") as source:
+        fallback = json.load(source)
+    entry = fallback["packages"].get(package_name)
+    if not entry:
+        raise RuntimeError(f"No lazy import map for {package_name}")
+    return lazy_loader.attach(package_name, entry["submodules"], entry["attributes"])
+
+
+lazy_loader.attach_stub = _attach_librosa_stub
 import librosa
 import numpy as np
 import yt_dlp

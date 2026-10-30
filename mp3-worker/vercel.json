@@ -1,5 +1,5 @@
 {
   "functions": {
-    "app.py": { "maxDuration": 300, "includeFiles": "assets/cover.jpg" }
+    "app.py": { "maxDuration": 300, "includeFiles": "assets/*" }
   }
 }
