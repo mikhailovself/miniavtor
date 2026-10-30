@@ -2,6 +2,7 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { waitUntil } from "@vercel/functions";
 import { friendContext, isKnownFriend } from "./friends.js";
 import { animatedEmojiIds, decorateAnimatedEmoji } from "./animated-emoji.js";
+import { checkSubscription, subscriptionKeyboard, subscriptionText, type SubscriptionState } from "./subscription.js";
 import {
   amendNote, cleanNote, dedupeNotes, esc, findSimilarSaved, formatNote, uniqueItems, MAX_CAPTION, MAX_TEXT,
   type Note, type NoteUpdate, type SavedNote,
@@ -1749,6 +1750,11 @@ async function mainView(user: User): Promise<View> {
   };
 }
 
+const subscriptionView = (state: SubscriptionState): View => ({
+  text: subscriptionText(state),
+  kb: subscriptionKeyboard(),
+});
+
 async function personalView(uid: string): Promise<View> {
   const [quiet, muted] = await redisPipe([["SISMEMBER", "outreach:muted", uid], ["SISMEMBER", "reminders:muted", uid]]);
   return { text: "<b>⚙️ Для себя</b>\n\n👇 Выбирай, что настроить\n\n⏰ <b>Напоминания проверяю раз в день.</b>\nПока они выключены, пропущенные напоминания не отправляются.", kb: { inline_keyboard: [
@@ -2412,6 +2418,25 @@ async function handleCallback(cb: any) {
   const uid = String(cb.from?.id ?? "");
   const chatId = cb.message?.chat?.id;
   const mid = cb.message?.message_id;
+  if (uid && chatId && cb.message?.chat?.type === "private") {
+    const state = await checkSubscription(TELEGRAM_BOT_TOKEN, Number(uid));
+    if (String(cb.data ?? "") === "subcheck") {
+      if (state === "subscribed") {
+        await ack(cb.message?.chat?.type === "private" ? "✅ Вижу подписку. Погнали!" : "✅ Вижу подписку. Позови меня ещё раз!");
+        if (cb.message?.chat?.type === "private") {
+          const loaded = await loadUser(uid);
+          if (!loaded.banned) await sendView(chatId, await mainView(loaded.user));
+        }
+      } else {
+        await ack(state === "error" ? "😵 Пока не могу проверить подписку" : "👀 Подписки пока не вижу");
+      }
+      return;
+    }
+    if (state !== "subscribed") {
+      await ack();
+      return;
+    }
+  }
   if (uid && chatId && mid && cb.message?.chat?.type !== "private" && String(cb.data ?? "").startsWith("noteitem:")) {
     const owner = await getGroupOwner(String(chatId));
     if (!owner || uid !== owner) { await ack("Отмечать пункты может владелец заметки"); return; }
@@ -3705,6 +3730,13 @@ async function handlePrivate(msg: any) {
     return result;
   };
 
+  const subscription = await checkSubscription(TELEGRAM_BOT_TOKEN, Number(uid));
+  if (subscription !== "subscribed") {
+    if (/^\/start(?:@\w+)?(?:\s|$)/i.test(String(msg.text ?? "").trim())) {
+      await sendView(chatId, subscriptionView(subscription));
+    }
+    return;
+  }
   if (!REDIS_URL) {
     await send("⚙️ Я пока не настроен, к проекту не подключена база. Напиши админу бота");
     return;
