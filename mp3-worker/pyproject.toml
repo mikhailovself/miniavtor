@@ -7,6 +7,7 @@ dependencies = [
   "yt-dlp[default]",
   "imageio-ffmpeg>=0.6.0",
   "numpy>=2.0,<3",
+  "librosa>=0.11,<1.1",
 ]
 
 [tool.vercel]

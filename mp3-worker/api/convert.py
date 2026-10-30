@@ -1,6 +1,6 @@
 """Single-video YouTube to MP3 worker, deployed as a separate Vercel project."""
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, gettempdir
 from urllib.parse import urlparse, parse_qs
 from urllib.request import Request, urlopen
 import base64
@@ -17,13 +17,19 @@ import subprocess
 import uuid
 import zipfile
 
+os.environ.setdefault("NUMBA_CACHE_DIR", str(Path(gettempdir()) / "miniavtor-numba"))
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
 import imageio_ffmpeg
+import librosa
 import numpy as np
 import yt_dlp
 
 MAX_DURATION = 600
 MAX_BYTES = 49 * 1024 * 1024
-SAMPLE_RATE = 11025
+SAMPLE_RATE = 22050
+SEARCH_SECONDS = 120
+ANALYSIS_SECONDS = 30
 PITCH_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 MAJOR = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
 MINOR = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
@@ -132,47 +138,100 @@ def telegram(method, fields, file_path=None):
 
 
 def audio_samples(mp3, ffmpeg):
-    result = subprocess.run([ffmpeg, "-v", "error", "-i", str(mp3), "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "f32le", "-"], capture_output=True, timeout=45, check=True)
-    return np.frombuffer(result.stdout, dtype="<f4")
+    result = subprocess.run([
+        ffmpeg, "-v", "error", "-i", str(mp3), "-vn", "-t", str(SEARCH_SECONDS),
+        "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "f32le", "-",
+    ], capture_output=True, timeout=45, check=True)
+    samples = np.frombuffer(result.stdout, dtype="<f4")
+    window_size = ANALYSIS_SECONDS * SAMPLE_RATE
+    if len(samples) <= window_size:
+        return samples.copy()
+    block_size = 5 * SAMPLE_RATE
+    block_count = len(samples) // block_size
+    blocks = samples[:block_count * block_size].reshape(block_count, block_size)
+    power = np.mean(blocks * blocks, axis=1)
+    window_power = np.convolve(power, np.ones(ANALYSIS_SECONDS // 5), mode="valid")
+    start = int(np.argmax(window_power)) * block_size
+    return samples[start:start + window_size].copy()
 
 
 def analyze(samples):
-    # Transient envelope and autocorrelation give a beat estimate. Half/double
-    # time is inherently ambiguous, so favour the conventional 70-180 range.
-    hop = 256
-    usable = len(samples) // hop * hop
-    frames = samples[:usable].reshape(-1, hop)
-    energy = np.sqrt(np.mean(frames * frames, axis=1))
-    onset = np.maximum(0, np.diff(energy, prepend=energy[0]))
-    onset -= np.mean(onset)
-    best_bpm, best_score = None, -1.0
-    for bpm in range(70, 181):
-        lag = round(60 * SAMPLE_RATE / (hop * bpm))
-        score = float(np.dot(onset[:-lag], onset[lag:])) if lag < len(onset) else 0
-        if score > best_score:
-            best_bpm, best_score = bpm, score
+    if len(samples) < SAMPLE_RATE * 5 or np.max(np.abs(samples)) < 1e-5:
+        return None, "не определена"
 
-    # Aggregate chroma from short FFT frames; compare with major/minor key
-    # profiles. This is an estimate, especially for sparse or atonal beats.
-    window_size = 8192
-    step = 4096
-    freqs = np.fft.rfftfreq(window_size, 1 / SAMPLE_RATE)
-    mask = (freqs >= 65) & (freqs <= 2000)
-    bins = np.mod(np.rint(69 + 12 * np.log2(freqs[mask] / 440)).astype(int), 12)
-    chroma = np.zeros(12)
-    window = np.hanning(window_size)
-    for pos in range(0, max(0, len(samples) - window_size), step):
-        spectrum = np.abs(np.fft.rfft(samples[pos:pos + window_size] * window))[mask]
-        np.add.at(chroma, bins, spectrum ** 0.6)
-    if not chroma.any():
-        return best_bpm, "не определена"
-    chroma = (chroma - chroma.mean()) / (chroma.std() + 1e-9)
+    # Separate drums from sustained notes before estimating tempo and key.
+    harmonic, percussive = librosa.effects.hpss(samples, hop_length=512)
+    onset = librosa.onset.onset_strength(y=percussive, sr=SAMPLE_RATE, hop_length=512)
+    bpm = None
+    if onset.size and np.max(onset) > 1e-5:
+        tempo, beats = librosa.beat.beat_track(
+            onset_envelope=onset, sr=SAMPLE_RATE, hop_length=512, trim=False,
+        )
+        estimate = float(np.asarray(tempo).reshape(-1)[0])
+        if len(beats) >= 4 and np.isfinite(estimate) and estimate > 0:
+            intervals = np.diff(beats) * 512 / SAMPLE_RATE
+            middle = float(np.median(intervals))
+            regular = intervals[(intervals >= middle * 0.75) & (intervals <= middle * 1.25)]
+            if len(regular) >= 3:
+                tracked_bpm = 60 / float(np.mean(regular))
+                if np.isfinite(tracked_bpm) and abs(tracked_bpm / estimate - 1) < 0.12:
+                    estimate = tracked_bpm
+            bpm = round(estimate)
+
+    # Constant-Q chroma resolves low notes better than the old FFT-bin mapping.
+    chroma_frames = librosa.feature.chroma_cqt(
+        y=harmonic, sr=SAMPLE_RATE, hop_length=512,
+    )
+    chroma = np.mean(chroma_frames, axis=1)
+    if not np.all(np.isfinite(chroma)) or chroma.std() < 1e-5:
+        return bpm, "не определена"
+    chroma = (chroma - chroma.mean()) / chroma.std()
     candidates = []
     for profile, suffix in [(MAJOR, "major"), (MINOR, "minor")]:
         norm = (profile - profile.mean()) / profile.std()
         for root in range(12):
             candidates.append((float(np.dot(chroma, np.roll(norm, root))), f"{PITCH_NAMES[root]} {suffix}"))
-    return best_bpm, max(candidates)[1]
+    return bpm, max(candidates)[1]
+
+
+def short_title(raw):
+    source = re.sub(r"[\r\n<>]", " ", str(raw or "Бит"))
+    label = r"(?:\[(?:FREE(?: FOR PROFIT(?: USE)?)?|PROD\.?[^\]]*)\]|\((?:FREE(?: FOR PROFIT(?: USE)?)?)\))"
+    source = re.sub(rf"(?i)^\s*(?:{label}\s*)+", "", source).strip()
+    descriptor = re.compile(r"(?i)\b(?:type\s+beat|beat|instrumental|freestyle|free\s+for\s+profit|prod\.?\s+by)\b")
+    # Producers put the beat name in quotes at different positions. Ignore
+    # quoted SEO phrases such as "FREE BEAT".
+    for match in re.finditer(r'["«“]([^"»”]{2,80})["»”]', source):
+        candidate = " ".join(match.group(1).split())
+        if not descriptor.search(candidate):
+            return candidate[:100]
+    # Other common layouts put the actual name before or after an SEO phrase.
+    first = source.split("|", 1)[0].strip()
+    meaningful = []
+    for part in re.split(r"\s+[-–—:]\s+", first):
+        candidate = re.sub(rf"(?i)^\s*(?:{label}\s*)+", "", part).strip()
+        candidate = re.sub(r"(?i)\s*\((?:prod\.?\s+by|free\b)[^)]*\)\s*$", "", candidate).strip()
+        if candidate and not descriptor.search(candidate) and not re.fullmatch(r"20\d{2}", candidate):
+            meaningful.append(candidate)
+    if meaningful:
+        return " - ".join(meaningful)[:100]
+    return " ".join(first.split())[:100].rstrip(" -–—") or "Бит"
+
+
+def set_mp3_tags(mp3, ffmpeg, title):
+    tagged = mp3.with_name("tagged.mp3")
+    cover = Path(__file__).resolve().parent.parent / "assets" / "cover.jpg"
+    if not cover.is_file():
+        raise RuntimeError("Track cover is missing from the worker deployment")
+    subprocess.run([
+        ffmpeg, "-v", "error", "-y", "-i", str(mp3), "-i", str(cover),
+        "-map", "0:a:0", "-map", "1:v:0", "-map_metadata", "-1",
+        "-c:a", "copy", "-c:v", "copy", "-disposition:v:0", "attached_pic",
+        "-metadata", f"title={title}", "-metadata", "artist=@mini_avtor_bot",
+        "-metadata:s:v:0", "title=Album cover", "-metadata:s:v:0", "comment=Cover (front)",
+        "-id3v2_version", "3", str(tagged),
+    ], capture_output=True, timeout=30, check=True)
+    tagged.replace(mp3)
 
 
 def convert(url, chat_id):
@@ -202,8 +261,14 @@ def convert(url, chat_id):
         if not mp3.exists() or mp3.stat().st_size > MAX_BYTES:
             raise BeatInputError("MP3 получился слишком большим для Telegram.")
         bpm, key = analyze(audio_samples(mp3, ffmpeg))
-        title = re.sub(r"[\r\n<>]", " ", str(info.get("title") or "Бит"))[:120]
+        title = short_title(info.get("title"))
+        set_mp3_tags(mp3, ffmpeg, title)
+        if mp3.stat().st_size > MAX_BYTES:
+            raise BeatInputError("MP3 получился слишком большим для Telegram.")
         copy_line = f"{bpm or '?'} BPM | {key}"
-        telegram("sendAudio", {"chat_id": str(chat_id), "caption": f"{title}\n{copy_line}\nBPM и тональность определены автоматически.", "title": title}, mp3)
+        telegram("sendAudio", {
+            "chat_id": str(chat_id), "title": title, "performer": "@mini_avtor_bot",
+            "caption": f"<code>{copy_line}</code>", "parse_mode": "HTML",
+        }, mp3)
 
 
