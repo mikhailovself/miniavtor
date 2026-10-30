@@ -1714,12 +1714,24 @@ async function applyNoteUpdate(uid: string, update: NoteUpdate, saved: SavedNote
 
 // ---------- Меню (кнопки) ----------
 
-type Button = { text: string; callback_data?: string; url?: string };
+type Button = { text: string; callback_data?: string; url?: string; icon_custom_emoji_id?: string };
 type View = { text: string; kb: { inline_keyboard: Button[][] } };
 
 const btn = (text: string, data: string): Button => ({ text, callback_data: data });
 const urlBtn = (text: string, url: string): Button => ({ text, url });
 const backBtn = (data = "menu", text = "Назад"): Button => btn(text, data);
+async function authorEmojiId(): Promise<string | null> {
+  const cacheKey = "ui:author_icon:avtor_emojis:v1";
+  const cached = await redis(["GET", cacheKey]);
+  if (cached) return cached === "none" ? null : String(cached);
+  const response = await tg("getStickerSet", { name: "avtor_emojis" });
+  const sticker = response.ok && Array.isArray(response.result?.stickers)
+    ? response.result.stickers.find((item: any) => item.type === "custom_emoji" && item.emoji?.includes("👍") && /^\d+$/.test(String(item.custom_emoji_id ?? "")))
+    : null;
+  const id = sticker?.custom_emoji_id ? String(sticker.custom_emoji_id) : null;
+  await redis(["SET", cacheKey, id ?? "none", "EX", 86400]);
+  return id;
+}
 const profileUrl = (username: string | undefined) => username && /^[A-Za-z0-9_]{5,32}$/.test(username) ? `https://t.me/${username}?profile` : null;
 const profileLink = (uid: string, username?: string) => profileUrl(username) ?? `tg://user?id=${uid}`;
 
@@ -1730,6 +1742,7 @@ async function mainView(user: User): Promise<View> {
     "🙋 <b>Про меня и про тебя</b>\nВозможности, создатель, настройки.\n\n" +
     "👇 Выбирай, что открыть:";
   const liveTarget = isOwner(user.id) ? String((await redis(["GET", "live:owner"])) ?? "") : "";
+  const authorIcon = await authorEmojiId();
   if (liveTarget) text += `\n\n⚠️ <b>Ты сейчас лично отвечаешь пользователю ${esc(liveTarget)}.</b>\nЛюбое обычное сообщение сюда уйдёт ему.\n🚪 /stoplive — выйти.`;
 
   return {
@@ -1738,7 +1751,7 @@ async function mainView(user: User): Promise<View> {
       inline_keyboard: [
         [btn("🤔 Чё я умею?", "abilities"), btn("👥 Добавить в группу", "groupadd")],
         [btn("🗂 автор.секретарь", "secretary"), btn("🎧 Скачать биток", "beat")],
-        [btn("🎤 автор.создатель", "author"), btn("⚙️ Для себя", "personal")],
+        [{ ...btn(authorIcon ? "автор бота" : "👍 автор бота", "author"), ...(authorIcon ? { icon_custom_emoji_id: authorIcon } : {}) }, btn("⚙️ Для себя", "personal")],
         ...(liveTarget ? [[btn("⏹ Выйти из ручного диалога", `ld:${liveTarget}:0`)]] : []),
         ...(isOwner(user.id) ? [[btn("⚙️ Админ-панель", "adm")]] : []),
       ],
@@ -2220,7 +2233,7 @@ async function groupView(id: string): Promise<View> {
 
 const authorView = (): View => ({
   text:
-    "<b>🎤 автор.создатель</b>\n\n" +
+    "<b>👍 автор бота</b>\n\n" +
     "💡 Меня придумал влад.автор.\n😏 Я, конечно, говорю, что он моя копия — ну а че, поспорь со мной хахаха.\n🔗 Вот его канал и ссылки:",
   kb: {
     inline_keyboard: [
@@ -2231,10 +2244,22 @@ const authorView = (): View => ({
   },
 });
 
+async function tgView(method: string, payload: Record<string, unknown>) {
+  const result = await tg(method, payload);
+  const keyboard = payload.reply_markup as View["kb"] | undefined;
+  if (result.ok || result.error_code !== 400 || !keyboard?.inline_keyboard?.some(row => row.some(button => button.icon_custom_emoji_id))) return result;
+  const fallback = keyboard.inline_keyboard.map(row => row.map(button => {
+    if (!button.icon_custom_emoji_id) return button;
+    const { icon_custom_emoji_id: _icon, ...rest } = button;
+    return { ...rest, text: `👍 ${rest.text}` };
+  }));
+  return tg(method, { ...payload, reply_markup: { inline_keyboard: fallback } });
+}
+
 async function sendView(chatId: number | string, v: View) {
   const key = `ui:menu:${chatId}`;
   const previousRaw = await redis(["GET", key]);
-  const result = await tg("sendMessage", {
+  const result = await tgView("sendMessage", {
     chat_id: chatId,
     text: v.text,
     parse_mode: "HTML",
@@ -2425,7 +2450,7 @@ async function handleCallback(cb: any) {
   const [action, arg1, arg2, arg3, arg4] = String(cb.data ?? "").split(":");
   const id = Number(arg1);
   const show = (v: View) =>
-    tg("editMessageText", {
+    tgView("editMessageText", {
       chat_id: chatId,
       message_id: mid,
       text: v.text,
