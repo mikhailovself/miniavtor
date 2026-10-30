@@ -141,14 +141,21 @@ def valid_youtube_url(raw):
         return False
 
 
-def telegram(method, fields, file_path=None):
+def safe_filename(title):
+    # Убираем символы, недопустимые в именах файлов, и управляющие символы.
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', " ", str(title or ""))
+    name = " ".join(name.split()).strip(" .")[:100].strip(" .")
+    return f"{name or 'Бит'}.mp3"
+
+
+def telegram(method, fields, file_path=None, filename="beat.mp3"):
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     if file_path:
         boundary = uuid.uuid4().hex
         chunks = []
         for key, value in fields.items():
             chunks.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n{value}\r\n".encode())
-        chunks.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"audio\"; filename=\"beat.mp3\"\r\nContent-Type: audio/mpeg\r\n\r\n".encode())
+        chunks.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"audio\"; filename=\"{filename}\"\r\nContent-Type: audio/mpeg\r\n\r\n".encode("utf-8"))
         chunks.append(Path(file_path).read_bytes())
         chunks.append(f"\r\n--{boundary}--\r\n".encode())
         body = b"".join(chunks)
@@ -408,7 +415,7 @@ def convert(url, chat_id, status_message_id=None):
         telegram("sendAudio", {
             "chat_id": str(chat_id), "title": title, "performer": "@mini_avtor_bot",
             "caption": copy_line, "parse_mode": "HTML",
-        }, mp3)
+        }, mp3, filename=safe_filename(title))
         if status_message_id:
             try:
                 telegram("deleteMessage", {"chat_id": str(chat_id), "message_id": status_message_id})

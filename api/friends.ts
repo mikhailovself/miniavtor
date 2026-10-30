@@ -56,7 +56,7 @@ const FRIENDS = [
 
 export const isKnownFriend = (uid: string): boolean => FRIENDS.some((p) => p.id === uid);
 
-export function friendContext(chatId: string, senderId: string, repliedToId?: string): string {
+export function friendContext(senderId: string, repliedToId?: string): string {
   const current = FRIENDS.find((p) => p.id === senderId);
   const replied = FRIENDS.find((p) => p.id === repliedToId);
   const roster = FRIENDS.map((p) => `${p.name} [ID ${p.id}, форма ${p.form}]: ${p.vibe}. Для дружеского подкола: ${p.tease}.`).join("\n");
