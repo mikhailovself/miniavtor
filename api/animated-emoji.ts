@@ -7,6 +7,10 @@ const PACKS = [
   "AnimatedAsianEmoji", "GummyBearEmoji", "ApplicationEmoji", "SparklesEmoji",
 ];
 const segmenter = new Intl.Segmenter("ru", { granularity: "grapheme" });
+// Один и тот же значок бывает записан с селектором вариации (U+FE0F) и без него: в тексте бота, в списке кандидатов
+// и в ответе Telegram он может отличаться. Поэтому всё сравниваем без селектора, иначе 🎞, 🛠 или ⬅️ теряют анимацию.
+const norm = (value: string) => value.replace(/️/g, "");
+const CANDIDATES = new Map(Object.entries(EMOJI_CANDIDATES).map(([emoji, list]) => [norm(emoji), list] as [string, string[]]));
 const emojiGrapheme = /[\p{Extended_Pictographic}\p{Emoji_Presentation}\p{Regional_Indicator}\u20e3\ufe0f]/u;
 function withoutEmoji(value: string): string {
   let cleaned = "";
@@ -56,19 +60,22 @@ export async function animatedEmojiIds(token: string): Promise<Map<string, strin
     const ids = new Map<string, string>();
     for (const sticker of candidates) {
       if (sticker.type === "custom_emoji" && sticker.emoji && sticker.custom_emoji_id &&
-          EMOJI_CANDIDATES[sticker.emoji]?.includes(sticker.custom_emoji_id) &&
-          (sticker.is_animated || sticker.is_video) && !sticker.needs_repainting && !ids.has(sticker.emoji)) {
-        ids.set(sticker.emoji, sticker.custom_emoji_id);
+          CANDIDATES.get(norm(sticker.emoji))?.includes(sticker.custom_emoji_id) &&
+          (sticker.is_animated || sticker.is_video) && !sticker.needs_repainting && !ids.has(norm(sticker.emoji))) {
+        ids.set(norm(sticker.emoji), sticker.custom_emoji_id);
       }
     }
     for (const sticker of sets.flat()) {
       if (sticker.type === "custom_emoji" && sticker.emoji && sticker.custom_emoji_id &&
-          (sticker.is_animated || sticker.is_video) && !sticker.needs_repainting && !ids.has(sticker.emoji)) {
-        ids.set(sticker.emoji, sticker.custom_emoji_id);
+          (sticker.is_animated || sticker.is_video) && !sticker.needs_repainting && !ids.has(norm(sticker.emoji))) {
+        ids.set(norm(sticker.emoji), sticker.custom_emoji_id);
       }
     }
     expires = Date.now() + (ids.size ? 6 * 60 * 60 * 1000 : 5 * 60 * 1000);
     console.info("Verified animated emoji", ids.size);
+    // Значки из списка кандидатов, которые Telegram не подтвердил как анимированные (для них нужен другой ID или другой значок).
+    const missing = [...CANDIDATES.keys()].filter(emoji => !ids.has(emoji));
+    if (missing.length) console.info("Emoji without animation", missing.join(" "));
     return ids;
   })();
   return cached;
@@ -87,7 +94,7 @@ function decorateHtml(html: string, ids: Map<string, string>): string {
     let cleaned = "";
     let removed = false;
     for (const { segment } of segmenter.segment(part)) {
-      const id = ids.get(segment);
+      const id = ids.get(norm(segment));
       if (id) { cleaned += `<tg-emoji emoji-id="${id}">${segment}</tg-emoji>`; removed = false; continue; }
       if (emojiGrapheme.test(segment)) { removed = true; continue; }
       if (removed && segment === " " && (!cleaned || /\s$/.test(cleaned))) { removed = false; continue; }
@@ -108,7 +115,7 @@ function decoratePlain(payload: Payload, field: "text" | "caption", ids: Map<str
   let cleaned = "";
   let removed = false;
   for (const { segment, index } of segmenter.segment(value)) {
-    const id = ids.get(segment);
+    const id = ids.get(norm(segment));
     if (!id && emojiGrapheme.test(segment)) {
       deleted.push({ start: index, end: index + segment.length });
       removed = true;
@@ -146,7 +153,7 @@ export function decorateAnimatedEmoji(method: string, original: Payload, ids: Ma
     const decorated = rows.map((row: any[]) => row.map(button => {
       if (typeof button.text !== "string") return button;
       const first = segmenter.segment(button.text)[Symbol.iterator]().next().value;
-      const id = first && ids.get(first.segment);
+      const id = first && ids.get(norm(first.segment));
       const hasPrefix = first && emojiGrapheme.test(first.segment) && /^\s/.test(button.text.slice(first.segment.length));
       const text = withoutEmoji(hasPrefix ? button.text.slice(first.segment.length).trimStart() : button.text);
       return hasPrefix && id && !button.icon_custom_emoji_id

@@ -8,6 +8,10 @@ import {
   amendNote, cleanNote, dedupeNotes, esc, findSimilarSaved, formatNote, uniqueItems, MAX_CAPTION, MAX_TEXT,
   type Note, type NoteUpdate, type SavedNote,
 } from "./notes.js";
+import { execFile } from "node:child_process";
+import { readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // ЧЕКЛИСТ ПРИ ДОБАВЛЕНИИ ЛЮБОЙ НОВОЙ ФУНКЦИИ (проходить каждый раз, прежде чем считать работу законченной):
 // 1. Все тексты функции (кнопки, подсказки, ответы, ошибки, подтверждения) пишем в стиле мини.автора:
@@ -248,14 +252,60 @@ function progressText(title: string, stages: { until: number; label: string }[],
 const beatProgressText = (percent: number, label?: string) => progressText("🎶 Делаю биток", BEAT_STAGES, percent, label);
 const beatProgressPayload = (chatId: number | string, text: string) => ({ chat_id: chatId, text, parse_mode: "HTML", keep_plain_squares: true });
 
-// Прогресс-бар кружка: та же полоска, что у битка. Воркер процент не отдаёт, этапы идут по времени (воркер ждём до 120 с).
+// Прогресс-бар кружка: та же полоска, что у битка. Реального процента нет, этапы идут по времени.
 const CIRCLE_STAGES = [
-  { until: 10, label: "Подключаюсь к конвертеру" },
-  { until: 40, label: "Скачиваю видос" },
-  { until: 75, label: "Режу центр кадра" },
-  { until: 101, label: "Кручу в кружок" },
+  { until: 25, label: "Скачиваю видос" },
+  { until: 55, label: "Режу центр кадра" },
+  { until: 85, label: "Кручу в кружок" },
+  { until: 101, label: "Отправляю" },
 ];
 const circleProgressText = (percent: number, label?: string) => progressText("🎞 Делаю кружок", CIRCLE_STAGES, percent, label);
+
+// Делает кружок из видео прямо в функции: скачивает файл из Telegram, обрезает центр кадра в квадрат 384x384 (максимум 60 с)
+// через ffmpeg-static и отправляет как video note. Нужен пакет ffmpeg-static (и includeFiles в vercel.json).
+async function makeCircle(fileId: string, chatId: number | string, duration?: number): Promise<boolean> {
+  const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const input = join(tmpdir(), `circle-${id}-in.mp4`);
+  const output = join(tmpdir(), `circle-${id}-out.mp4`);
+  try {
+    let ffmpegPath: string | null = null;
+    try {
+      const mod: any = await import("ffmpeg-static");
+      ffmpegPath = mod.default ?? mod;
+    } catch (error) { console.error("ffmpeg-static не загрузился", error); }
+    if (!ffmpegPath) {
+      await notifyOwner("⚠️ Кружки не работают: в проекте нет ffmpeg-static. Добавь пакет ffmpeg-static и includeFiles для него в vercel.json", "circle-ffmpeg");
+      return false;
+    }
+    const file = await tg("getFile", { file_id: fileId });
+    const path: string | undefined = file.result?.file_path;
+    if (!path) return false;
+    const download = await fetchT(`https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${path}`, {}, 8000);
+    if (!download.ok) return false;
+    await writeFile(input, Buffer.from(await download.arrayBuffer()));
+    const ffmpeg = ffmpegPath;
+    await new Promise<void>((resolve, reject) => execFile(ffmpeg, [
+      "-y", "-i", input, "-t", "60",
+      "-vf", "crop='min(iw,ih)':'min(iw,ih)',scale=384:384",
+      "-r", "30", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p",
+      "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", output,
+    ], { timeout: 15000 }, (error) => error ? reject(error) : resolve()));
+    const form = new FormData();
+    form.append("chat_id", String(chatId));
+    form.append("length", "384");
+    if (duration) form.append("duration", String(Math.min(60, Math.round(duration))));
+    form.append("video_note", new Blob([await readFile(output)], { type: "video/mp4" }), "circle.mp4");
+    const sent = await fetchT(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVideoNote`, { method: "POST", body: form }, 8000);
+    const data: any = await sent.json().catch(() => ({}));
+    if (!data.ok) console.error("sendVideoNote", data);
+    return Boolean(data.ok);
+  } catch (error) {
+    console.error("makeCircle", error);
+    return false;
+  } finally {
+    await Promise.allSettled([rm(input, { force: true }), rm(output, { force: true })]);
+  }
+}
 
 // Отправка в лог-бота: с таймаутом, trim() токена и понятной причиной ошибки.
 // Возвращает null при успехе, иначе текст ошибки (для /logtest).
@@ -1830,10 +1880,17 @@ async function applyNoteUpdate(uid: string, update: NoteUpdate, saved: SavedNote
 
 // ---------- Меню (кнопки) ----------
 
-type Button = { text: string; callback_data?: string; url?: string; icon_custom_emoji_id?: string };
+type Button = { text: string; callback_data?: string; url?: string; icon_custom_emoji_id?: string; style?: "primary" | "success" | "danger" };
 type View = { text: string; kb: { inline_keyboard: Button[][] } };
 
-const btn = (text: string, data: string): Button => ({ text, callback_data: data });
+const btn = (text: string, data: string): Button => {
+  const action = data.split(":")[0];
+  const danger = new Set(["delyes", "profdelyes", "disyes", "bstop", "memclear", "pmforget"]);
+  const success = new Set(["bgo", "profgo", "profend", "brun", "bretry", "whset"]);
+  const primary = new Set(["abilities", "groupadd", "secretary", "tools", "author", "personal", "connect", "topics", "beat", "circle"]);
+  const style = danger.has(action) ? "danger" : success.has(action) ? "success" : primary.has(action) ? "primary" : undefined;
+  return { text, callback_data: data, ...(style ? { style } : {}) };
+};
 const urlBtn = (text: string, url: string): Button => ({ text, url });
 const backBtn = (data = "menu", text = "Назад"): Button => btn(text, data);
 const profileUrl = (username: string | undefined) => username && /^[A-Za-z0-9_]{5,32}$/.test(username) ? `https://t.me/${username}?profile` : null;
@@ -1865,7 +1922,7 @@ const subscriptionView = (state: SubscriptionState): View => ({
 
 async function personalView(uid: string): Promise<View> {
   const [quiet, muted] = await redisPipe([["SISMEMBER", "outreach:muted", uid], ["SISMEMBER", "reminders:muted", uid]]);
-  return { text: "<b>⚙️ Для себя</b>\n\n👇 Выбирай, что настроить\n\n⏰ <b>Напоминания проверяю раз в день.</b>\nПока они выключены, пропущенные напоминания не отправляются.", kb: { inline_keyboard: [
+  return { text: "<b>⚙️ Для себя</b>\n\n👇 Выбирай, че настроить\n\n⏰ <b>Напоминалки проверяю раз в день</b>\nПока они выключены, пропущенные я не пришлю, сорян", kb: { inline_keyboard: [
     [btn(`💬 Личные вбросы: ${Number(quiet) ? "выкл" : "вкл"}`, "personalout")],
     [btn(`⏰ Напоминания: ${Number(muted) ? "выкл" : "вкл"}`, "personalrem")],
     [btn("🧠 Что я запомнил", "personalmem")],
@@ -1883,7 +1940,7 @@ async function personalMemoryView(uid: string): Promise<View> {
 // ---------- Инструменты и форма «Чё добавить?» ----------
 
 const toolsView = (): View => ({
-  text: "<b>🛠 Инструменты</b>\n\nМои полезные штучки, выбирай))\n\n🎶 <b>Скачать биток.</b> Кидаешь ссылку с ютуба, я возвращаю mp3 с BPM и тональностью\n🎞 <b>Сделать кружок.</b> Кидаешь видос, я делаю из него кружок\n💡 <b>Чё добавить?</b> Пиши, какими ботами пользуешься, че в них бесит и че хотелось бы видеть тут, я подумаю че сюда впихнуть",
+  text: "<b>🛠 Инструменты</b>\n\nМои полезные штучки, выбирай))\n\n— <b>🎶 Скачать биток.</b> Кидаешь ссылку с ютуба, я возвращаю mp3 с BPM и тональностью\n\n— <b>🎞 Сделать кружок.</b> Кидаешь видос, я делаю из него кружок (отправляй лучше в 480р, кружки как раз в таком разрешении)\n\n— <b>💡 Чё добавить?</b> Пиши, какими ботами пользуешься, че в них бесит и че хотелось бы видеть тут, я подумаю че сюда впихнуть",
   kb: { inline_keyboard: [
     [btn("🎶 Скачать биток", "beat")],
     [btn("🎞 Сделать кружок", "circle")],
@@ -1939,7 +1996,7 @@ const abilitiesView = (): View => ({
     "— <b>🧠 Запоминаю.</b> Скажи «запомни, что…», и потом можешь спросить, что я помню, или попросить забыть.\n\n" +
     "— <b>🙋 Узнаю тебя.</b> В «Для себя» → «Рассказать о себе» можно ответить на пару вопросов, и я буду лучше понимать, с кем болтаю.\n\n" +
     "— <b>👋 Иногда пишу первым.</b> Могу внезапно кинуть мем, трек или какую-нибудь хуйню.\n🤫 Если надоем — /quiet.",
-  kb: { inline_keyboard: [[btn("👥 Добавить в группу", "groupadd")], [btn("🗂 автор.секретарь", "secretary")], [backBtn("menu", "⬅️ Назад")]] },
+  kb: { inline_keyboard: [[backBtn("menu", "⬅️ Назад")]] },
 });
 
 async function regularGroupView(): Promise<View> {
@@ -2745,7 +2802,7 @@ async function handleCallback(cb: any) {
       break;
     case "circle":
       await redis(["SET", `st:${uid}`, JSON.stringify({ action: "circle" }), "EX", 600]);
-      await show({ text: "<b>🎞 Сделать кружок</b>\n\nКидай видос, я сделаю из него кружок. Беру центр кадра, максимум 60 секунд, а файл не больше 20 МБ, иначе тг не даёт мне его скачать", kb: { inline_keyboard: [[backBtn("tools", "⬅️ Назад")]] } });
+      await show({ text: "<b>🎞 Сделать кружок</b>\n\nКидай видос, я сделаю из него кружок. Беру центр кадра, максимум 60 секунд, а файл не больше 20 МБ, иначе тг не даёт мне его скачать\n\n(отправляй лучше в 480р, кружки как раз в таком разрешении)", kb: { inline_keyboard: [[backBtn("tools", "⬅️ Назад")]] } });
       break;
     case "wish":
       await redis(["SET", `st:${uid}`, JSON.stringify({ action: "wish" }), "EX", 3600]);
@@ -4027,39 +4084,25 @@ async function handlePrivate(msg: any) {
   try { circleWaiting = JSON.parse(String(beatStateRaw))?.action === "circle"; } catch {}
   if (cmd === "/circle" && !hasLiveMedia) {
     await redis(["SET", `st:${uid}`, JSON.stringify({ action: "circle" }), "EX", 600]);
-    await send("🎞 Кидай видос, сделаю кружок. Беру центр кадра, максимум 60 секунд");
+    await send("🎞 Кидай видос, сделаю кружок. Беру центр кадра, максимум 60 секунд\n(отправляй лучше в 480р, кружки как раз в таком разрешении)");
     return;
   }
   const circleSrc = msg.video ?? msg.animation ?? (msg.document?.mime_type?.startsWith("video/") ? msg.document : null);
   if (circleSrc && (circleWaiting || cmd === "/circle")) {
-    const circleUrl = process.env.CIRCLE_WORKER_URL;
-    if (!circleUrl || !MP3_WORKER_SECRET) { await send("⚙️ Кружки пока не настроены. Напиши админу бота"); return; }
     if ((circleSrc.file_size ?? 0) > 20_000_000) { await send("📦 Файл больше 20 МБ, тг не даёт мне его скачать. Кинь поменьше"); return; }
     await redis(["DEL", `st:${uid}`]);
     const status: any = await tg("sendMessage", beatProgressPayload(chatId, circleProgressText(0)));
     const sid: number | undefined = status.ok ? status.result?.message_id : undefined;
     waitUntil((async () => {
-      const work: Promise<boolean> = (async () => {
-        try {
-          const response = await fetch(circleUrl, {
-            method: "POST",
-            headers: { "Content-Type": "application/json", "Authorization": `Bearer ${MP3_WORKER_SECRET}` },
-            body: JSON.stringify({ file_id: circleSrc.file_id, chat_id: chatId, duration: circleSrc.duration }),
-            signal: AbortSignal.timeout(120000),
-          });
-          if (!response.ok) console.error("circle worker HTTP", response.status, (await response.text()).slice(0, 500));
-          return response.ok;
-        } catch (error) {
-          console.error("circle worker", error);
-          return false;
-        }
-      })();
+      // makeCircle ограничивает время скачивания, перекодирования и отправки.
+      // Не объявляем ошибку раньше завершения: иначе кружок может прийти после неё.
+      const work = makeCircle(circleSrc.file_id, chatId, circleSrc.duration);
       if (sid) {
-        // Каждые ~2.5 с полоска ползёт к 97% всё медленнее, со случайным разбросом, и ждёт ответа воркера.
+        // Каждые ~2.5 с полоска ползёт к 97% всё медленнее, со случайным разбросом, и ждёт, пока кружок будет готов.
         let percent = 0;
         let shown = circleProgressText(0);
         while (!(await Promise.race([work.then(() => true), new Promise<boolean>(r => setTimeout(() => r(false), 2500))]))) {
-          percent = Math.min(97, percent + Math.max(0.5, (97 - percent) * 0.1) * (0.7 + Math.random() * 0.6));
+          percent = Math.min(97, percent + Math.max(0.5, (97 - percent) * 0.18) * (0.7 + Math.random() * 0.6));
           const text = circleProgressText(Math.floor(percent));
           if (text === shown) continue;
           shown = text;
@@ -4627,11 +4670,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (!REDIS_URL || !REDIS_TOKEN) return res.status(503).send("redis is not configured");
   const doneKey = `update:done:${upd.update_id}`;
   const lockKey = `update:processing:${upd.update_id}`;
-  // Lease exceeds the configured 30-second function lifetime. A killed worker
+  // Lease exceeds the configured 300-second function lifetime. A killed worker
   // cannot leave a permanent lock; concurrent delivery must remain retryable.
   try {
     if (await redis(["GET", doneKey])) return res.status(200).send("ok");
-    if (await redis(["SET", lockKey, "1", "NX", "EX", 60]) !== "OK") return res.status(503).send("update is processing");
+    if (await redis(["SET", lockKey, "1", "NX", "EX", 330]) !== "OK") return res.status(503).send("update is processing");
     // Another worker may have completed between GET and lock acquisition.
     if (await redis(["GET", doneKey])) return res.status(200).send("ok");
     if (upd?.callback_query) {

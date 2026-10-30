@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@vercel/functions": "^3.10.4"
+    "@vercel/functions": "^3.10.4",
+    "ffmpeg-static": "^5.2.0"
   },
   "devDependencies": {
     "@vercel/node": "^5.0.0",
