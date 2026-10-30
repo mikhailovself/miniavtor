@@ -9,12 +9,13 @@ const start = source.indexOf("async function mainView(");
 const end = source.indexOf("\nasync function connectView(", start);
 assert.ok(start >= 0 && end > start);
 const code = stripTypeScriptTypes(source.slice(start, end));
+const AUTHOR_ICON_ID = source.match(/const AUTHOR_ICON_ID = "(\d+)"/)?.[1];
 
 test("start menu leads to abilities, ordinary group and secretary", async () => {
   const views = runInNewContext(`${code}\n({ mainView, abilitiesView, regularGroupView, secretaryView })`, {
     isOwner: () => false,
     redis: async () => null,
-    authorEmojiId: async () => "123456789",
+    AUTHOR_ICON_ID,
     botName: async () => "example_bot",
     btn: (text, callback_data) => ({ text, callback_data }),
     urlBtn: (text, url) => ({ text, url }),
@@ -24,7 +25,7 @@ test("start menu leads to abilities, ordinary group and secretary", async () => 
   const menu = await views.mainView({ id: "123" });
   const callbacks = menu.kb.inline_keyboard.flat().map((button) => button.callback_data);
   assert.deepEqual(Array.from(callbacks), ["abilities", "groupadd", "secretary", "beat", "author", "personal"]);
-  assert.equal(menu.kb.inline_keyboard[2][0].icon_custom_emoji_id, "123456789");
+  assert.equal(menu.kb.inline_keyboard[2][0].icon_custom_emoji_id, "5384084295465854839");
   assert.equal(menu.kb.inline_keyboard[2][0].text, "автор бота");
   assert.deepEqual(Array.from(menu.kb.inline_keyboard.slice(0, 3), row => row.length), [2, 2, 2]);
   assert.match(menu.text, /Творчество и дела/);
@@ -62,27 +63,6 @@ test("opening a new menu removes the previous bot menu after sending", async () 
   assert.deepEqual(calls.map(call => call.method), ["sendMessage", "sendMessage", "deleteMessage"]);
   assert.equal(calls[2].payload.message_id, 100);
   assert.equal(JSON.parse(saved.get("ui:menu:42")).id, 101);
-});
-
-test("author icon resolves the thumbs-up custom emoji from the linked pack", async () => {
-  const first = source.indexOf("async function authorEmojiId(");
-  const last = source.indexOf("\nconst profileUrl", first);
-  const saved = new Map();
-  const requests = [];
-  const { authorEmojiId } = runInNewContext(`${stripTypeScriptTypes(source.slice(first, last))}\n({ authorEmojiId })`, {
-    redis: async ([command, key, value]) => command === "GET" ? saved.get(key) : saved.set(key, value),
-    tg: async (method, payload) => {
-      requests.push({ method, payload });
-      return { ok: true, result: { stickers: [
-        { type: "custom_emoji", emoji: "🎤", custom_emoji_id: "111" },
-        { type: "custom_emoji", emoji: "👍", custom_emoji_id: "222" },
-      ] } };
-    },
-  });
-  assert.equal(await authorEmojiId(), "222");
-  assert.equal(await authorEmojiId(), "222");
-  assert.equal(requests.length, 1);
-  assert.equal(requests[0].payload.name, "avtor_emojis");
 });
 
 test("unsupported custom emoji icon falls back to a regular thumbs-up", async () => {

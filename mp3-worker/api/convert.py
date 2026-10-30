@@ -166,7 +166,18 @@ def update_progress(chat_id, message_id, text):
     if not message_id:
         return
     try:
-        telegram("editMessageText", {"chat_id": str(chat_id), "message_id": message_id, "text": text})
+        emoji_ids = {"🎧": "6007938409857815902", "🎛": "5936170807716745162", "📤": "5433614747381538714"}
+        fields = {"chat_id": str(chat_id), "message_id": message_id, "text": text}
+        animated = text
+        for emoji, emoji_id in emoji_ids.items():
+            animated = animated.replace(emoji, f'<tg-emoji emoji-id="{emoji_id}">{emoji}</tg-emoji>')
+        if animated != text:
+            try:
+                telegram("editMessageText", {**fields, "text": animated, "parse_mode": "HTML"})
+                return
+            except Exception:
+                logging.warning("Animated progress emoji unavailable; using normal emoji")
+        telegram("editMessageText", fields)
     except Exception:
         logging.exception("Could not update beat progress")
 

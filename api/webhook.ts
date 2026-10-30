@@ -1,6 +1,7 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { waitUntil } from "@vercel/functions";
 import { friendContext, isKnownFriend } from "./friends.js";
+import { decorateTelegramPayload } from "./emoji.js";
 import {
   amendNote, cleanNote, dedupeNotes, esc, findSimilarSaved, formatNote, uniqueItems, MAX_CAPTION, MAX_TEXT,
   type Note, type NoteUpdate, type SavedNote,
@@ -154,12 +155,20 @@ const isOwner = (uid: string | number | undefined) => !!OWNER_ID && uid !== unde
 // ---------- Telegram ----------
 
 async function tg(method: string, payload: Record<string, unknown>) {
-  const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  const data: any = await r.json();
+  const decorated = decorateTelegramPayload(method, payload);
+  const request = async (body: Record<string, unknown>) => {
+    const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return r.json();
+  };
+  let data: any = await request(decorated);
+  if (!data.ok && data.error_code === 400 && decorated !== payload) {
+    console.warn("Telegram custom emoji rejected, retrying without decoration", method);
+    data = await request(payload);
+  }
   if (!data.ok) console.error("Telegram error", method, data);
   return data;
 }
@@ -1720,18 +1729,7 @@ type View = { text: string; kb: { inline_keyboard: Button[][] } };
 const btn = (text: string, data: string): Button => ({ text, callback_data: data });
 const urlBtn = (text: string, url: string): Button => ({ text, url });
 const backBtn = (data = "menu", text = "Назад"): Button => btn(text, data);
-async function authorEmojiId(): Promise<string | null> {
-  const cacheKey = "ui:author_icon:avtor_emojis:v1";
-  const cached = await redis(["GET", cacheKey]);
-  if (cached) return cached === "none" ? null : String(cached);
-  const response = await tg("getStickerSet", { name: "avtor_emojis" });
-  const sticker = response.ok && Array.isArray(response.result?.stickers)
-    ? response.result.stickers.find((item: any) => item.type === "custom_emoji" && item.emoji?.includes("👍") && /^\d+$/.test(String(item.custom_emoji_id ?? "")))
-    : null;
-  const id = sticker?.custom_emoji_id ? String(sticker.custom_emoji_id) : null;
-  await redis(["SET", cacheKey, id ?? "none", "EX", 86400]);
-  return id;
-}
+const AUTHOR_ICON_ID = "5384084295465854839";
 const profileUrl = (username: string | undefined) => username && /^[A-Za-z0-9_]{5,32}$/.test(username) ? `https://t.me/${username}?profile` : null;
 const profileLink = (uid: string, username?: string) => profileUrl(username) ?? `tg://user?id=${uid}`;
 
@@ -1742,7 +1740,6 @@ async function mainView(user: User): Promise<View> {
     "🙋 <b>Про меня и про тебя</b>\nВозможности, создатель, настройки.\n\n" +
     "👇 Выбирай, что открыть:";
   const liveTarget = isOwner(user.id) ? String((await redis(["GET", "live:owner"])) ?? "") : "";
-  const authorIcon = await authorEmojiId();
   if (liveTarget) text += `\n\n⚠️ <b>Ты сейчас лично отвечаешь пользователю ${esc(liveTarget)}.</b>\nЛюбое обычное сообщение сюда уйдёт ему.\n🚪 /stoplive — выйти.`;
 
   return {
@@ -1751,7 +1748,7 @@ async function mainView(user: User): Promise<View> {
       inline_keyboard: [
         [btn("🤔 Чё я умею?", "abilities"), btn("👥 Добавить в группу", "groupadd")],
         [btn("🗂 автор.секретарь", "secretary"), btn("🎧 Скачать биток", "beat")],
-        [{ ...btn(authorIcon ? "автор бота" : "👍 автор бота", "author"), ...(authorIcon ? { icon_custom_emoji_id: authorIcon } : {}) }, btn("⚙️ Для себя", "personal")],
+        [{ ...btn("автор бота", "author"), icon_custom_emoji_id: AUTHOR_ICON_ID }, btn("⚙️ Для себя", "personal")],
         ...(liveTarget ? [[btn("⏹ Выйти из ручного диалога", `ld:${liveTarget}:0`)]] : []),
         ...(isOwner(user.id) ? [[btn("⚙️ Админ-панель", "adm")]] : []),
       ],
@@ -1778,14 +1775,14 @@ async function personalMemoryView(uid: string): Promise<View> {
 
 const abilitiesView = (): View => ({
   text: "<b>🤔 Чё я умею?</b>\n\n" +
-    "<b>💬 Болтаю.</b> Пиши мне в личку что угодно, обажаю пиздеть, на любые темы! Гс и кружки тоже понимаю.\n\n" +
-    "<b>🗂 Работаю секретарём.</b> Веду твои заметки, сохраняю че напишешь или скажешь в гс, и сам раскидываю их по тематическим папкам в тг: покупки, идеи, фильмы, долги — что придумаешь, так и сделаем!\n✏️ Могу даже дополнить заметку, изменить сумму долга, отметить просмотренный фильм или удалить то, что больше не нужно.\n\n" +
-    "<b>🎧 Скачиваю биты для твоих демок.</b> Пришли /beat и ссылку на YouTube — верну MP3 с BPM и тональностью. Или жми «Скачать биток» в меню.\n\n" +
-    "<b>⏰ Напоминаю.</b> Если в заметке есть дата, напишу за день и в сам день, чтоб ты не забыл, растяпа!\n\n" +
-    "<b>🎭 Тусуюсь в группах.</b> Добавь меня к друзьям — иногда сам влезу с шуткой, комментом, мемом, стикером или реакцией.\n📣 А если позовёшь через @ или ответишь на моё сообщение, отвечу сразу.\n\n" +
-    "<b>🧠 Запоминаю.</b> Скажи «запомни, что…», и потом можешь спросить, что я помню, или попросить забыть.\n\n" +
-    "<b>🙋 Узнаю тебя.</b> В «Для себя» → «Рассказать о себе» можно ответить на пару вопросов, и я буду лучше понимать, с кем болтаю.\n\n" +
-    "<b>👋 Иногда пишу первым.</b> Могу внезапно кинуть мем, трек или какую-нибудь хуйню.\n🤫 Если надоем — /quiet.",
+    "— <b>💬 Болтаю.</b> Пиши мне в личку что угодно, обажаю пиздеть, на любые темы! Гс и кружки тоже понимаю.\n\n" +
+    "— <b>🗂 Работаю секретарём.</b> Веду твои заметки, сохраняю че напишешь или скажешь в гс, и сам раскидываю их по тематическим папкам в тг: покупки, идеи, фильмы, долги — что придумаешь, так и сделаем!\n✏️ Могу даже дополнить заметку, изменить сумму долга, отметить просмотренный фильм или удалить то, что больше не нужно.\n\n" +
+    "— <b>🎧 Скачиваю биты для твоих демок.</b> Пришли /beat и ссылку на YouTube — верну MP3 с BPM и тональностью. Или жми «Скачать биток» в меню.\n\n" +
+    "— <b>⏰ Напоминаю.</b> Если в заметке есть дата, напишу за день и в сам день, чтоб ты не забыл, растяпа!\n\n" +
+    "— <b>🎭 Тусуюсь в группах.</b> Добавь меня к друзьям — иногда сам влезу с шуткой, комментом, мемом, стикером или реакцией.\n📣 А если позовёшь через @ или ответишь на моё сообщение, отвечу сразу.\n\n" +
+    "— <b>🧠 Запоминаю.</b> Скажи «запомни, что…», и потом можешь спросить, что я помню, или попросить забыть.\n\n" +
+    "— <b>🙋 Узнаю тебя.</b> В «Для себя» → «Рассказать о себе» можно ответить на пару вопросов, и я буду лучше понимать, с кем болтаю.\n\n" +
+    "— <b>👋 Иногда пишу первым.</b> Могу внезапно кинуть мем, трек или какую-нибудь хуйню.\n🤫 Если надоем — /quiet.",
   kb: { inline_keyboard: [[btn("👥 Добавить в группу", "groupadd")], [btn("🗂 автор.секретарь", "secretary")], [backBtn("menu", "⬅️ Назад")]] },
 });
 
@@ -3716,7 +3713,7 @@ async function handlePrivate(msg: any) {
   };
 
   if (!REDIS_URL) {
-    await send("Я пока не настроен, к проекту не подключена база. Напиши админу бота");
+    await send("⚙️ Я пока не настроен, к проекту не подключена база. Напиши админу бота");
     return;
   }
   if (isOwner(uid)) await migrateLegacy();
@@ -3735,14 +3732,14 @@ async function handlePrivate(msg: any) {
   try { ownerState = ownerStateRaw ? JSON.parse(String(ownerStateRaw)) : null; } catch {}
   if (isOwner(uid) && cmd === "/stoplive") {
     const stopped = await stopLive();
-    await send(stopped ? `Вышел из диалога с ${stopped}. Миниавтор снова отвечает сам.` : "Ты сейчас ни к кому не подключён.");
+    await send(stopped ? `👋 Вышел из диалога с ${stopped}. Миниавтор снова отвечает сам.` : "💬 Ты сейчас ни к кому не подключён.");
     return;
   }
   if (isOwner(uid) && ordinary && msg.reply_to_message?.message_id && (await deliverOwnerAnswer(msg))) return;
   if (isOwner(uid) && ordinary && !["broadcast", "meme_upload", "source", "beat"].includes(ownerState?.action)) {
     const target = String((await redis(["GET", "live:owner"])) ?? "");
     if (target) {
-      if (!(await relayFromOwner(msg, target))) await send("Не отправилось человеку. Попробуй ещё раз или выйди через /stoplive.");
+      if (!(await relayFromOwner(msg, target))) await send("⚠️ Не отправилось человеку. Попробуй ещё раз или выйди через /stoplive.");
       return;
     }
   }
@@ -3773,9 +3770,9 @@ async function handlePrivate(msg: any) {
     return;
   }
   if (mp3Url || cmd === "/beat" || beatWaiting && !cmd.startsWith("/")) {
-    if (!mp3Url) { await send("Нужна ссылка на одно видео YouTube. Попробуй ещё раз."); return; }
+    if (!mp3Url) { await send("🔗 Нужна ссылка на одно видео YouTube. Попробуй ещё раз."); return; }
     if (beatWaiting) await redis(["DEL", `st:${uid}`]);
-    if (!MP3_WORKER_URL || !MP3_WORKER_SECRET) { await send("Конвертация пока не настроена. Напиши админу бота."); return; }
+    if (!MP3_WORKER_URL || !MP3_WORKER_SECRET) { await send("⚙️ Конвертация пока не настроена. Напиши админу бота."); return; }
     const progress = await send("🎧 Готовлю бит\n▱▱▱ 0/3");
     const statusMessageId = progress.ok ? progress.result?.message_id : undefined;
     if (statusMessageId) await closeMenuView(chatId);
@@ -3835,35 +3832,35 @@ async function handlePrivate(msg: any) {
   if (cmd === "/about") return void (await sendView(chatId, await profileView(uid)));
   if (cmd === "/quiet") {
     await redisPipe([["SADD", "outreach:muted", uid], ["ZREM", "outreach:due", uid]]);
-    await send("Ок, случайных вбросов не будет");
+    await send("🤫 Ок, случайных вбросов не будет");
     return;
   }
   if (cmd === "/unquiet") {
     await redisPipe([["SREM", "outreach:muted", uid], ["ZADD", "outreach:due", Date.now() + (2 + Math.floor(Math.random() * 3)) * 86400000, uid]]);
-    await send("Ок, иногда буду врываться");
+    await send("👋 Ок, иногда буду врываться");
     return;
   }
   if (cmd === "/admin" && isOwner(uid)) return void (await sendView(chatId, await adminView()));
   if (cmd === "/groups" && isOwner(uid)) return void (await sendView(chatId, await groupsView()));
   if (cmd === "/memories") {
     const items = await chatMemories(`private:${uid}`);
-    await send(items.length ? `Что помню о тебе:\n${items.map((m) => `${m.id}: ${m.text}${m.joke ? " (тогда я прикалывался, что не запомню)" : ""}`).join("\n").slice(0, 3400)}` : "Пока ничего не запомнил. Напиши «запомни, что ...»");
+    await send(items.length ? `🧠 Что помню о тебе:\n${items.map((m) => `${m.id}: ${m.text}${m.joke ? " (тогда я прикалывался, что не запомню)" : ""}`).join("\n").slice(0, 3400)}` : "🧠 Пока ничего не запомнил. Напиши «запомни, что ...»");
     return;
   }
   if (cmd === "/forgetmemory") {
-    if (!/^\d+$/.test(arg)) { await send("Напиши /forgetmemory ID из списка /memories"); return; }
+    if (!/^\d+$/.test(arg)) { await send("🧠 Напиши /forgetmemory ID из списка /memories"); return; }
     const scope = `private:${uid}`;
     const exists = await redis(["HGET", `group:memory:${scope}`, arg]);
-    if (!exists) { await send("Такого факта нет"); return; }
+    if (!exists) { await send("🤷 Такого факта нет"); return; }
     await forgetInChat(scope, arg);
-    await send("Забыл, бро");
+    await send("🧠 Забыл, бро");
     return;
   }
 
   if (cmd === "/cancel") {
     await redis(["DEL", `st:${uid}`]);
     if (isOwner(uid)) await redis(["DEL", "broadcast:draft"]);
-    await send("Ладна атменил");
+    await send("👌 Ладна атменил");
     return;
   }
 
@@ -3920,7 +3917,7 @@ async function handlePrivate(msg: any) {
   }
 
   if (cmd.startsWith("/")) {
-    await send("Не знаю такой команды. Открой /menu");
+    await send("🤷 Не знаю такой команды. Открой /menu");
     return;
   }
 
@@ -3929,7 +3926,7 @@ async function handlePrivate(msg: any) {
   if (profileStep) {
     const value = cleanProfileValue(text);
     if (!value) {
-      await send("Жду ответ текстом. Можно нажать «Пропустить» или написать /cancel");
+      await send("✍️ Жду ответ текстом. Можно нажать «Пропустить» или написать /cancel");
       return;
     }
     await redis(["HSET", `profile:${uid}`, profileField(profileStep.step), value]);
@@ -4004,7 +4001,7 @@ async function handlePrivate(msg: any) {
   const remember = text.match(/(?:^|\s)(?:запомни|помни|не забудь)\s*[:,]?\s*(?:что\s+)?(.+)/i);
   if (remember) {
     const fact = remember[1].trim().replace(/[.!?]+$/, "");
-    if (fact.length < 3) await send("Чё именно запомнить?");
+    if (fact.length < 3) await send("🧠 Чё именно запомнить?");
     else {
       const ack = memoryReply();
       await rememberInChat(`private:${uid}`, uid, msg.message_id, fact, ack.joke);
@@ -4023,15 +4020,15 @@ async function handlePrivate(msg: any) {
     const matches = items.filter((m) => what && (m.text.toLowerCase().includes(what) || what.includes(m.text.toLowerCase())));
     if (matches.length === 1) {
       await forgetInChat(`private:${uid}`, matches[0].id);
-      await send("Забыл, бро");
-    } else await send("Не понял, что забыть. Напиши /memories и /forgetmemory ID");
+      await send("🧠 Забыл, бро");
+    } else await send("🤔 Не понял, что забыть. Напиши /memories и /forgetmemory ID");
     return;
   }
 
   const att = attachFromMessage(msg);
   const saveVideo = Boolean(msg.video?.file_id && /(?:сохрани|запиши|сохранить|записать)/i.test(text));
   if (!text.trim() && !att && !saveVideo) {
-    await send("Я понимаю текст, фотки, голосовые и кружки. Остальное хз");
+    await send("💬 Я понимаю текст, фотки, голосовые и кружки. Остальное хз");
     return;
   }
 
@@ -4061,7 +4058,7 @@ async function handlePrivate(msg: any) {
       const value = JSON.stringify(n.note).toLowerCase().replace(/ё/g, "е");
       return debtDirection ? n.note.direction === debtDirection : terms.some(t => value.includes(t));
     }).slice(0, 10);
-    if (!hits.length) { await send("Не нашёл подходящую заметку. Попробуй название или имя"); return; }
+    if (!hits.length) { await send("🔎 Не нашёл подходящую заметку. Попробуй название или имя"); return; }
     const groupId = user.group.startsWith("-100") ? user.group.slice(4) : "";
     await sendView(chatId, { text: `<b>🔎 Нашёл заметки</b>\n\n${hits.map(n => `• ${esc(n.note.title)}`).join("\n")}`, kb: { inline_keyboard: hits.flatMap(n => groupId ? [[urlBtn(`📌 ${n.note.title}`.slice(0, 60), `https://t.me/c/${groupId}/${n.message}`)]] : []) } });
     return;
@@ -4069,7 +4066,7 @@ async function handlePrivate(msg: any) {
 
   const limit = await checkLimit(uid);
   if (!limit.ok) {
-    await send(`На сегодня лимит всё: ${await setting("daily")} сообщений в сутки. Завтра обнулится`);
+    await send(`⏳ На сегодня лимит всё: ${await setting("daily")} сообщений в сутки. Завтра обнулится`);
     return;
   }
 
@@ -4085,7 +4082,7 @@ async function handlePrivate(msg: any) {
   if (att) {
     const m = await loadAttach(att);
     if (!m) {
-      await send(`Не могу открыть это ${att.label}, мож слишком большое. Кинь поменьше или текстом`);
+      await send(`📎 Не могу открыть это ${att.label}, мож слишком большое. Кинь поменьше или текстом`);
       return;
     }
     media = m;
@@ -4104,7 +4101,7 @@ async function handlePrivate(msg: any) {
   } catch (e: any) {
     if (e instanceof LLMDown) {
       console.error(e.message);
-      await send("Нейронки щас все отвалились, хз. Попробуй через пару минут");
+      await send("⚠️ Нейронки щас все отвалились, хз. Попробуй через пару минут");
       await notifyOwner(`⚠️ У пользователя ${uid} не ответила ни одна нейросеть.\n${e.message}`, "llm");
       return;
     }
@@ -4141,7 +4138,7 @@ async function handlePrivate(msg: any) {
   }
 
   if (!notes.length && !reply && !updates.length) {
-    await send("Ты че несешь, не понял. Напиши по-другому?");
+    await send("🤔 Ты че несешь, не понял. Напиши по-другому?");
     return;
   }
 
