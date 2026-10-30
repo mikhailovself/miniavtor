@@ -1737,8 +1737,8 @@ async function mainView(user: User): Promise<View> {
     kb: {
       inline_keyboard: [
         [btn("🤔 Чё я умею?", "abilities"), btn("👥 Добавить в группу", "groupadd")],
-        [btn("🗂 автор.секретарь", "secretary"), btn("🎤 автор.создатель", "author")],
-        [btn("🎧 Скачать биток", "beat"), btn("⚙️ Для себя", "personal")],
+        [btn("🗂 автор.секретарь", "secretary"), btn("🎧 Скачать биток", "beat")],
+        [btn("🎤 автор.создатель", "author"), btn("⚙️ Для себя", "personal")],
         ...(liveTarget ? [[btn("⏹ Выйти из ручного диалога", `ld:${liveTarget}:0`)]] : []),
         ...(isOwner(user.id) ? [[btn("⚙️ Админ-панель", "adm")]] : []),
       ],
@@ -2218,31 +2218,6 @@ async function groupView(id: string): Promise<View> {
   };
 }
 
-const helpView = (): View => ({
-  text:
-    "<b>🆘 Памагите, как этим пользоваться</b>\n\n" +
-    "✍️ Пиши мне в личку что угодно: идеи, долги, фильмы, дела, ссылки.\n🗂 Я сам выберу топик в твоей групке и оформлю заметку (ну я стараюсь).\n💬 Если просто потрепаться, отвечу и ничего не запишу\n\n" +
-    "🧭 Если кладу не туда: «Мои топики» → топик → «Подсказка мне» (коротко че сюда класть)\n\n" +
-    "⏰ Если в заметке есть дата, напомню тебе в личке за день и в день срока около 09:00 МСК.\n📝 Например: «запиши: 5 ноября оплатить интернет».\n✏️ Срок можно изменить или удалить вместе с заметкой\n\n" +
-    "<b>👥 Обычная группа без тем:</b> просто добавь меня к людям. Иногда сам встряну в разговор, пошучу, прокомментирую фото, скину мем или поставлю реакцию.\n📣 Через @упоминание или ответ на моё сообщение можно позвать меня напрямую.\n🗒 Группа с темами работает отдельно, для заметок.\n\n" +
-    "<b>🚀 Первый раз:</b> жми «Подключить группу» там все написано\n\n" +
-    "<b>⌨️ Команды в личке:</b>\n" +
-    "— /menu: менюшка\n" +
-    "— /topics: мои топики\n" +
-    "— /connect: как подключить группу\n" +
-    "— /quiet: выключить случайные вбросы\n" +
-    "— /unquiet: снова получать вбросы\n" +
-    "— /deleteme: удалить мои данные\n\n" +
-    "<b>👑 Команды в группе</b> (только у того кто подключил группу, в нужном топике):\n" +
-    "— /connect: подключить группу (админ группы)\n" +
-    "— /ids: запомнить топик\n" +
-    "— /desc текст: подсказка для топика\n" +
-    "— /default: сделать топик запасным\n" +
-    "— /forget: забыть топик\n" +
-    "— /disconnect: отключить группу",
-  kb: { inline_keyboard: [[backBtn("menu", "⬅️ В меню")]] },
-});
-
 const authorView = (): View => ({
   text:
     "<b>🎤 автор.создатель</b>\n\n" +
@@ -2300,7 +2275,6 @@ async function setupCommands() {
       { command: "beat", description: "Скачать биток из YouTube в MP3" },
       { command: "topics", description: "Мои топики" },
       { command: "connect", description: "Как подключить группу" },
-      { command: "help", description: "Памагите" },
       { command: "author", description: "Автор" },
       { command: "about", description: "Рассказать о себе" },
       { command: "quiet", description: "Выключить случайные вбросы" },
@@ -2323,9 +2297,9 @@ async function setupCommands() {
 }
 
 async function ensureCommands(force = false) {
-  if (!force && (await redis(["GET", "cmds:v7"]))) return;
+  if (!force && (await redis(["GET", "cmds:v8"]))) return;
   await setupCommands();
-  await redis(["SET", "cmds:v7", "1"]);
+  await redis(["SET", "cmds:v8", "1"]);
 }
 
 // ---------- Кнопки ----------
@@ -2558,7 +2532,7 @@ async function handleCallback(cb: any) {
       await show(await connectView(user));
       break;
     case "help":
-      await show(helpView());
+      await show(await mainView(user));
       break;
     case "adm":
     case "admb":
@@ -3824,13 +3798,14 @@ async function handlePrivate(msg: any) {
   }
 
   if (cmd === "/menu" || MENU_BUTTON_TEXTS.includes(text.trim())) {
+    await ensureCommands();
     await redis(["DEL", `st:${uid}`]);
     await sendView(chatId, await mainView(user));
     return;
   }
   if (cmd === "/topics") return void (await sendView(chatId, await topicsView(user)));
   if (cmd === "/connect") return void (await sendView(chatId, await connectView(user)));
-  if (cmd === "/help") return void (await sendView(chatId, helpView()));
+  if (cmd === "/help") return void (await sendView(chatId, await mainView(user)));
   if (cmd === "/author") return void (await sendView(chatId, authorView()));
   if (cmd === "/about") return void (await sendView(chatId, await profileView(uid)));
   if (cmd === "/quiet") {
@@ -3920,7 +3895,7 @@ async function handlePrivate(msg: any) {
   }
 
   if (cmd.startsWith("/")) {
-    await send("Не знаю такой команды. Открой /menu или /help");
+    await send("Не знаю такой команды. Открой /menu");
     return;
   }
 
