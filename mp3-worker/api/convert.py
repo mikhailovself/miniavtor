@@ -3,6 +3,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from urllib.parse import urlparse, parse_qs
 from urllib.request import Request, urlopen
+import base64
 import json
 import os
 import re
@@ -19,6 +20,10 @@ SAMPLE_RATE = 11025
 PITCH_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 MAJOR = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
 MINOR = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+
+
+class BeatInputError(ValueError):
+    pass
 
 
 def valid_youtube_url(raw):
@@ -104,24 +109,31 @@ def analyze(samples):
 def convert(url, chat_id):
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     with TemporaryDirectory() as temp:
+        cookie_file = None
+        encoded_cookies = os.environ.get("YOUTUBE_COOKIES_BASE64", "").strip()
+        if encoded_cookies:
+            cookie_file = Path(temp) / "youtube-cookies.txt"
+            cookie_file.write_bytes(base64.b64decode(encoded_cookies, validate=True))
         options = {
             "format": "bestaudio/best", "outtmpl": str(Path(temp) / "audio.%(ext)s"),
             "noplaylist": True, "quiet": True, "no_warnings": True,
             "ffmpeg_location": ffmpeg, "max_filesize": MAX_BYTES,
             "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
         }
+        if cookie_file:
+            options["cookiefile"] = str(cookie_file)
         with yt_dlp.YoutubeDL(options) as downloader:
             info = downloader.extract_info(url, download=False)
             if not info or info.get("_type") == "playlist":
-                raise ValueError("Нужна ссылка на одно видео.")
+                raise BeatInputError("Нужна ссылка на одно видео.")
             if not info.get("duration") or info["duration"] > MAX_DURATION:
-                raise ValueError("Пока беру только видео до 10 минут.")
+                raise BeatInputError("Пока беру только видео до 10 минут.")
             if (info.get("filesize") or info.get("filesize_approx") or 0) > MAX_BYTES:
-                raise ValueError("Файл слишком большой для Telegram.")
+                raise BeatInputError("Файл слишком большой для Telegram.")
             downloader.download([url])
         mp3 = Path(temp) / "audio.mp3"
         if not mp3.exists() or mp3.stat().st_size > MAX_BYTES:
-            raise ValueError("MP3 получился слишком большим для Telegram.")
+            raise BeatInputError("MP3 получился слишком большим для Telegram.")
         bpm, key = analyze(audio_samples(mp3, ffmpeg))
         title = re.sub(r"[\r\n<>]", " ", str(info.get("title") or "Бит"))[:120]
         copy_line = f"{bpm or '?'} BPM | {key}"

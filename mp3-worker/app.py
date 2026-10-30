@@ -4,7 +4,7 @@ from pydantic import BaseModel
 import os
 import traceback
 
-from api.convert import convert, telegram, valid_youtube_url
+from api.convert import BeatInputError, convert, telegram, valid_youtube_url
 
 app = FastAPI()
 
@@ -25,6 +25,9 @@ def convert_beat(payload: BeatRequest, authorization: str | None = Header(defaul
         convert(payload.url, payload.chat_id)
     except Exception as error:
         traceback.print_exc()
-        message = str(error) if isinstance(error, ValueError) else "Не получилось скачать или обработать это видео. Попробуй другую ссылку позже."
+        if isinstance(error, BeatInputError):
+            message = str(error)
+        else:
+            message = "Не получилось сделать MP3 из этого видео. Попробуй позже или пришли другую ссылку."
         telegram("sendMessage", {"chat_id": str(payload.chat_id), "text": message[:300]})
     return {"ok": True}
