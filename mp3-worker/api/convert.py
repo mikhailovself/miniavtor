@@ -9,11 +9,11 @@ import logging
 import json
 import os
 import re
+import shutil
 import subprocess
 import uuid
 
 import imageio_ffmpeg
-import deno
 import numpy as np
 import yt_dlp
 
@@ -50,6 +50,23 @@ def load_youtube_cookies(temp):
     path.write_bytes(contents)
     path.chmod(0o600)
     return path
+
+
+def javascript_runtime():
+    # Vercel installs Python packages under _vendor and may omit the script
+    # directory where the deno PyPI wheel places its executable.
+    deno_path = shutil.which("deno")
+    if deno_path:
+        logging.warning("YouTube JS runtime: deno found")
+        return {"deno": {"path": deno_path}}
+    node_path = shutil.which("node")
+    if node_path:
+        version = subprocess.run([node_path, "--version"], capture_output=True, text=True, timeout=5, check=True).stdout.strip()
+        if int(version.lstrip("v").split(".")[0]) >= 22:
+            logging.warning("YouTube JS runtime: node %s found", version)
+            return {"node": {"path": node_path}}
+    logging.error("YouTube JS runtime: neither Deno nor Node 22+ is available in Vercel function")
+    raise RuntimeError("No supported JavaScript runtime available")
 
 
 def valid_youtube_url(raw):
@@ -134,15 +151,14 @@ def analyze(samples):
 
 def convert(url, chat_id):
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    deno_path = deno.find_deno_bin()
-    logging.warning("YouTube JS runtime: Deno available: %s", Path(deno_path).is_file())
+    js_runtimes = javascript_runtime()
     with TemporaryDirectory() as temp:
         cookie_file = load_youtube_cookies(temp)
         options = {
             "format": "bestaudio/best", "outtmpl": str(Path(temp) / "audio.%(ext)s"),
             "noplaylist": True, "quiet": True, "no_warnings": True,
             "ffmpeg_location": ffmpeg, "max_filesize": MAX_BYTES,
-            "js_runtimes": {"deno": {"path": deno_path}},
+            "js_runtimes": js_runtimes,
             "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
         }
         if cookie_file:
