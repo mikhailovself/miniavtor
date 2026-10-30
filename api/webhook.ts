@@ -1724,7 +1724,11 @@ const profileUrl = (username: string | undefined) => username && /^[A-Za-z0-9_]{
 const profileLink = (uid: string, username?: string) => profileUrl(username) ?? `tg://user?id=${uid}`;
 
 async function mainView(user: User): Promise<View> {
-  let text = "<b>📋 Менюшка</b>\n\n👇 Ну че, куда?";
+  let text = "<b>📋 Менюшка</b>\n\n" +
+    "🎛 <b>Творчество и дела</b>\nБит, заметки, группа.\n" +
+    "────────────\n" +
+    "🙋 <b>Про меня и про тебя</b>\nВозможности, создатель, настройки.\n\n" +
+    "👇 Выбирай, что открыть:";
   const liveTarget = isOwner(user.id) ? String((await redis(["GET", "live:owner"])) ?? "") : "";
   if (liveTarget) text += `\n\n⚠️ <b>Ты сейчас лично отвечаешь пользователю ${esc(liveTarget)}.</b>\nЛюбое обычное сообщение сюда уйдёт ему.\n🚪 /stoplive — выйти.`;
 
@@ -1732,12 +1736,9 @@ async function mainView(user: User): Promise<View> {
     text,
     kb: {
       inline_keyboard: [
-        [btn("🤔 Чё я умею?", "abilities")],
-        [btn("👥 Добавить в группу", "groupadd")],
-        [btn("🗂 автор.секретарь", "secretary")],
-        [btn("🎧 Скачать биток", "beat")],
-        [btn("🎤 автор.создатель", "author")],
-        [btn("⚙️ Для себя", "personal")],
+        [btn("🎧 Скачать биток", "beat"), btn("🗂 Секретарь", "secretary")],
+        [btn("👥 В группу", "groupadd"), btn("⚙️ Для себя", "personal")],
+        [btn("🤔 Чё я умею?", "abilities"), btn("🎤 Создатель", "author")],
         ...(liveTarget ? [[btn("⏹ Выйти из ручного диалога", `ld:${liveTarget}:0`)]] : []),
         ...(isOwner(user.id) ? [[btn("⚙️ Админ-панель", "adm")]] : []),
       ],
@@ -2256,13 +2257,40 @@ const authorView = (): View => ({
 });
 
 async function sendView(chatId: number | string, v: View) {
-  return tg("sendMessage", {
+  const key = `ui:menu:${chatId}`;
+  const previousRaw = await redis(["GET", key]);
+  const result = await tg("sendMessage", {
     chat_id: chatId,
     text: v.text,
     parse_mode: "HTML",
     disable_web_page_preview: true,
     reply_markup: v.kb,
   });
+  if (result.ok && result.result?.message_id) {
+    await redis(["SET", key, JSON.stringify({ id: result.result.message_id, at: Date.now() }), "EX", 172800]);
+    if (previousRaw) {
+      try {
+        const previous = JSON.parse(String(previousRaw));
+        if (Number.isSafeInteger(previous.id) && previous.id !== result.result.message_id && Date.now() - previous.at < 47 * 3600000) {
+          await tg("deleteMessage", { chat_id: chatId, message_id: previous.id });
+        }
+      } catch (error) { console.error("menu cleanup", error); }
+    }
+  }
+  return result;
+}
+
+async function closeMenuView(chatId: number | string) {
+  const key = `ui:menu:${chatId}`;
+  const raw = await redis(["GET", key]);
+  if (!raw) return;
+  await redis(["DEL", key]);
+  try {
+    const previous = JSON.parse(String(raw));
+    if (Number.isSafeInteger(previous.id) && Date.now() - previous.at < 47 * 3600000) {
+      await tg("deleteMessage", { chat_id: chatId, message_id: previous.id });
+    }
+  } catch (error) { console.error("menu cleanup", error); }
 }
 
 async function setupCommands() {
@@ -2506,7 +2534,7 @@ async function handleCallback(cb: any) {
       break;
     case "beat":
       await redis(["SET", `st:${uid}`, JSON.stringify({ action: "beat" }), "EX", 600]);
-      await show({ text: "🎧 Пришли ссылку на один бит с YouTube. Или сразу напиши /beat и ссылку через пробел. Верну MP3 с примерными BPM и тональностью.", kb: { inline_keyboard: [[backBtn()]] } });
+      await show({ text: "<b>🎧 Скачать биток</b>\n\nПришли ссылку на видео с YouTube — верну MP3 с BPM и тональностью.", kb: { inline_keyboard: [[backBtn("menu", "⬅️ В меню")]] } });
       break;
     case "abilities":
       await show(abilitiesView());
@@ -3742,26 +3770,36 @@ async function handlePrivate(msg: any) {
   const mp3Url = youtubeUrl(mp3Input);
   if (cmd === "/beat" && !arg) {
     await redis(["SET", `st:${uid}`, JSON.stringify({ action: "beat" }), "EX", 600]);
-    await send("Пришли ссылку на один бит с YouTube. Или напиши /beat https://youtu.be/...");
+    await send("🎧 Пришли ссылку на бит с YouTube.\nВерну MP3 с BPM и тональностью.");
     return;
   }
   if (mp3Url || cmd === "/beat" || beatWaiting && !cmd.startsWith("/")) {
-    if (!mp3Url) { await send("Нужна ссылка на одно видео YouTube: /beat https://youtu.be/..."); return; }
+    if (!mp3Url) { await send("Нужна ссылка на одно видео YouTube. Попробуй ещё раз."); return; }
     if (beatWaiting) await redis(["DEL", `st:${uid}`]);
     if (!MP3_WORKER_URL || !MP3_WORKER_SECRET) { await send("Конвертация пока не настроена. Напиши админу бота."); return; }
-    await send("Ща сделаю MP3 и прикину BPM с тональностью. Пришлю файл сюда, когда будет готово.");
+    const progress = await send("🎧 Готовлю бит\n▱▱▱ 0/3");
+    const statusMessageId = progress.ok ? progress.result?.message_id : undefined;
+    if (statusMessageId) await closeMenuView(chatId);
     waitUntil((async () => {
       try {
         const response = await fetch(MP3_WORKER_URL, {
           method: "POST",
           headers: { "Content-Type": "application/json", "Authorization": `Bearer ${MP3_WORKER_SECRET}` },
-          body: JSON.stringify({ url: mp3Url, chat_id: chatId }),
+          body: JSON.stringify({ url: mp3Url, chat_id: chatId, status_message_id: statusMessageId }),
           signal: AbortSignal.timeout(285000),
         });
-        if (!response.ok) throw new Error(`worker HTTP ${response.status}`);
+        if (!response.ok) {
+          console.error("mp3 worker HTTP", response.status, response.headers.get("content-type"), (await response.text()).slice(0, 500));
+          const detail = "Не получилось сделать MP3 из этого видео. Попробуй позже или пришли другую ссылку.";
+          if (statusMessageId) await tg("editMessageText", { chat_id: chatId, message_id: statusMessageId, text: detail });
+          else await send(detail);
+          return;
+        }
       } catch (error) {
         console.error("mp3 worker", error);
-        await send("Не получилось связаться с конвертером. Попробуй позже.");
+        const detail = "Не получилось сделать MP3 из этого видео. Попробуй позже или пришли другую ссылку.";
+        if (statusMessageId) await tg("editMessageText", { chat_id: chatId, message_id: statusMessageId, text: detail });
+        else await send(detail);
       }
     })());
     return;

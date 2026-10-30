@@ -159,6 +159,16 @@ def telegram(method, fields, file_path=None):
         result = json.load(response)
     if not result.get("ok"):
         raise RuntimeError(f"Telegram {method}: {result.get('description', 'unknown error')}")
+    return result.get("result")
+
+
+def update_progress(chat_id, message_id, text):
+    if not message_id:
+        return
+    try:
+        telegram("editMessageText", {"chat_id": str(chat_id), "message_id": message_id, "text": text})
+    except Exception:
+        logging.exception("Could not update beat progress")
 
 
 def audio_samples(mp3, ffmpeg):
@@ -188,11 +198,14 @@ def analyze(samples):
     onset = librosa.onset.onset_strength(y=percussive, sr=SAMPLE_RATE, hop_length=512)
     bpm = None
     if onset.size and np.max(onset) > 1e-5:
-        tempo, beats = librosa.beat.beat_track(
-            onset_envelope=onset, sr=SAMPLE_RATE, hop_length=512, trim=False,
-        )
-        estimate = float(np.asarray(tempo).reshape(-1)[0])
-        if len(beats) >= 4 and np.isfinite(estimate) and estimate > 0:
+        def tracked_tempo(start_bpm):
+            tempo, beats = librosa.beat.beat_track(
+                onset_envelope=onset, sr=SAMPLE_RATE, hop_length=512,
+                start_bpm=start_bpm, trim=False,
+            )
+            estimate = float(np.asarray(tempo).reshape(-1)[0])
+            if len(beats) < 4 or not np.isfinite(estimate) or estimate <= 0:
+                return None
             intervals = np.diff(beats) * 512 / SAMPLE_RATE
             middle = float(np.median(intervals))
             regular = intervals[(intervals >= middle * 0.75) & (intervals <= middle * 1.25)]
@@ -200,6 +213,14 @@ def analyze(samples):
                 tracked_bpm = 60 / float(np.mean(regular))
                 if np.isfinite(tracked_bpm) and abs(tracked_bpm / estimate - 1) < 0.12:
                     estimate = tracked_bpm
+            return estimate
+
+        estimate = tracked_tempo(120)
+        if estimate and estimate >= 160:
+            half_time = tracked_tempo(90)
+            if half_time and abs(estimate / half_time - 2) < 0.08:
+                estimate = half_time
+        if estimate:
             bpm = round(estimate)
 
     # Constant-Q chroma resolves low notes better than the old FFT-bin mapping.
@@ -258,7 +279,7 @@ def set_mp3_tags(mp3, ffmpeg, title):
     tagged.replace(mp3)
 
 
-def convert(url, chat_id):
+def convert(url, chat_id, status_message_id=None):
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     js_runtimes = javascript_runtime()
     with TemporaryDirectory() as temp:
@@ -280,19 +301,29 @@ def convert(url, chat_id):
                 raise BeatInputError("Пока беру только видео до 10 минут.")
             if (info.get("filesize") or info.get("filesize_approx") or 0) > MAX_BYTES:
                 raise BeatInputError("Файл слишком большой для Telegram.")
-            downloader.download([url])
+            update_progress(chat_id, status_message_id, "🎧 Скачиваю аудио\n▰▱▱ 1/3")
+            # The resolved info already contains the selected format and URL.
+            # Re-extracting the YouTube page repeats its JS challenge.
+            downloader.process_info(info)
         mp3 = Path(temp) / "audio.mp3"
         if not mp3.exists() or mp3.stat().st_size > MAX_BYTES:
             raise BeatInputError("MP3 получился слишком большим для Telegram.")
+        update_progress(chat_id, status_message_id, "🎛 Определяю BPM и тональность\n▰▰▱ 2/3")
         bpm, key = analyze(audio_samples(mp3, ffmpeg))
         title = short_title(info.get("title"))
         set_mp3_tags(mp3, ffmpeg, title)
         if mp3.stat().st_size > MAX_BYTES:
             raise BeatInputError("MP3 получился слишком большим для Telegram.")
         copy_line = f"{bpm or '?'} BPM | {key}"
+        update_progress(chat_id, status_message_id, "📤 Отправляю MP3\n▰▰▰ 3/3")
         telegram("sendAudio", {
             "chat_id": str(chat_id), "title": title, "performer": "@mini_avtor_bot",
             "caption": f"<code>{copy_line}</code>", "parse_mode": "HTML",
         }, mp3)
+        if status_message_id:
+            try:
+                telegram("deleteMessage", {"chat_id": str(chat_id), "message_id": status_message_id})
+            except Exception:
+                logging.exception("Could not remove beat progress")
 
 

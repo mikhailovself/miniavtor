@@ -12,6 +12,7 @@ app = FastAPI()
 class BeatRequest(BaseModel):
     url: str
     chat_id: int
+    status_message_id: int | None = None
 
 
 @app.post("/api/convert")
@@ -22,12 +23,18 @@ def convert_beat(payload: BeatRequest, authorization: str | None = Header(defaul
     if not valid_youtube_url(payload.url) or payload.chat_id <= 0:
         raise HTTPException(status_code=400, detail="invalid request")
     try:
-        convert(payload.url, payload.chat_id)
+        convert(payload.url, payload.chat_id, payload.status_message_id)
     except Exception as error:
         traceback.print_exc()
         if isinstance(error, BeatInputError):
             message = str(error)
         else:
             message = "Не получилось сделать MP3 из этого видео. Попробуй позже или пришли другую ссылку."
-        telegram("sendMessage", {"chat_id": str(payload.chat_id), "text": message[:300]})
+        if payload.status_message_id:
+            try:
+                telegram("editMessageText", {"chat_id": str(payload.chat_id), "message_id": payload.status_message_id, "text": message[:300]})
+            except Exception:
+                telegram("sendMessage", {"chat_id": str(payload.chat_id), "text": message[:300]})
+        else:
+            telegram("sendMessage", {"chat_id": str(payload.chat_id), "text": message[:300]})
     return {"ok": True}
