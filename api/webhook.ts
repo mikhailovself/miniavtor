@@ -1481,7 +1481,7 @@ async function callGemini(p: Provider, turns: ChatTurn[], system: string, decls:
         toolConfig: { functionCallingConfig: { mode: "ANY", allowedFunctionNames: decls.map((d) => d.name) } },
         safetySettings: [
           { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_ONLY_HIGH" },
-          { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_ONLY_HIGH" },
+          { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" }, // бот по характеру грубит в ответ, иначе Gemini режет такие ответы и бот молчит
         ],
       }),
     },
@@ -1490,6 +1490,7 @@ async function callGemini(p: Provider, turns: ChatTurn[], system: string, decls:
   const data: any = await r.json().catch(() => ({}));
   if (!r.ok) throw new ProviderError(r.status, String(data?.error?.message ?? "request failed").slice(0, 120));
   const parts: any[] = data.candidates?.[0]?.content?.parts ?? [];
+  if (!parts.length) console.error("Gemini вернул пустой ответ", data.candidates?.[0]?.finishReason, JSON.stringify(data.promptFeedback ?? {}).slice(0, 200));
   const out: Parsed = { notes: [], reply: "" };
   for (const x of parts) {
     if (x.functionCall?.name === "save_note") out.notes.push(x.functionCall.args as Note);
