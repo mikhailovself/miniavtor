@@ -9,13 +9,11 @@ const start = source.indexOf("async function mainView(");
 const end = source.indexOf("\nasync function connectView(", start);
 assert.ok(start >= 0 && end > start);
 const code = stripTypeScriptTypes(source.slice(start, end));
-const AUTHOR_ICON_ID = source.match(/const AUTHOR_ICON_ID = "(\d+)"/)?.[1];
 
 test("start menu leads to abilities, ordinary group and secretary", async () => {
   const views = runInNewContext(`${code}\n({ mainView, abilitiesView, regularGroupView, secretaryView })`, {
     isOwner: () => false,
     redis: async () => null,
-    AUTHOR_ICON_ID,
     botName: async () => "example_bot",
     btn: (text, callback_data) => ({ text, callback_data }),
     urlBtn: (text, url) => ({ text, url }),
@@ -25,8 +23,7 @@ test("start menu leads to abilities, ordinary group and secretary", async () => 
   const menu = await views.mainView({ id: "123" });
   const callbacks = menu.kb.inline_keyboard.flat().map((button) => button.callback_data);
   assert.deepEqual(Array.from(callbacks), ["abilities", "groupadd", "secretary", "beat", "author", "personal"]);
-  assert.equal(menu.kb.inline_keyboard[2][0].icon_custom_emoji_id, "5384084295465854839");
-  assert.equal(menu.kb.inline_keyboard[2][0].text, "автор бота");
+  assert.equal(menu.kb.inline_keyboard[2][0].text, "👍 автор бота");
   assert.deepEqual(Array.from(menu.kb.inline_keyboard.slice(0, 3), row => row.length), [2, 2, 2]);
   assert.equal(menu.text, "<b>📋 Менюшка</b>\n\nНу че, куда?");
   assert.match(views.abilitiesView().text, /тематическим папкам/);
@@ -65,11 +62,12 @@ test("opening a new menu removes the previous bot menu after sending", async () 
   assert.equal(JSON.parse(saved.get("ui:menu:42")).id, 101);
 });
 
-test("unsupported custom emoji icon falls back to a regular thumbs-up", async () => {
+test("unsupported custom emoji icon falls back to a text-only button", async () => {
   const first = source.indexOf("async function tgView(");
   const last = source.indexOf("\nasync function sendView(", first);
   const calls = [];
   const { tgView } = runInNewContext(`${stripTypeScriptTypes(source.slice(first, last))}\n({ tgView })`, {
+    plainEmojiFallback: (_, payload) => payload,
     tg: async (method, payload) => {
       calls.push({ method, payload });
       return calls.length === 1 ? { ok: false, error_code: 400 } : { ok: true };
@@ -79,6 +77,6 @@ test("unsupported custom emoji icon falls back to a regular thumbs-up", async ()
     { text: "автор бота", callback_data: "author", icon_custom_emoji_id: "222" },
   ]] } });
   assert.equal(result.ok, true);
-  assert.equal(calls[1].payload.reply_markup.inline_keyboard[0][0].text, "👍 автор бота");
+  assert.equal(calls[1].payload.reply_markup.inline_keyboard[0][0].text, "автор бота");
   assert.equal(calls[1].payload.reply_markup.inline_keyboard[0][0].icon_custom_emoji_id, undefined);
 });

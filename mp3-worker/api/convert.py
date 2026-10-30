@@ -205,25 +205,29 @@ def update_progress(chat_id, message_id, text):
     if not message_id:
         return
     try:
-        fields = {"chat_id": str(chat_id), "message_id": message_id, "text": text}
-        emoji = text[:2].strip()
-        emoji_id = progress_emoji_ids().get(emoji)
-        if emoji_id:
-            try:
-                telegram("editMessageText", {**fields, "text": text.replace(emoji, f'<tg-emoji emoji-id="{emoji_id}">{emoji}</tg-emoji>', 1), "parse_mode": "HTML"})
-                return
-            except Exception:
-                logging.warning("Animated progress emoji unavailable; using normal emoji")
-        telegram("editMessageText", fields)
+        ids = progress_emoji_ids()
+        emoji = ("🎧", "⬇️", "🎛", "📤")
+        pattern = re.compile("|".join(map(re.escape, emoji)))
+        plain = pattern.sub("", text)
+        animated = pattern.sub(lambda match: (
+            f'<tg-emoji emoji-id="{ids[match.group()]}">{match.group()}</tg-emoji>'
+            if match.group() in ids else ""
+        ), text)
+        fields = {"chat_id": str(chat_id), "message_id": message_id}
+        try:
+            telegram("editMessageText", {**fields, "text": animated, "parse_mode": "HTML"})
+        except Exception:
+            logging.warning("Animated progress emoji unavailable; using text-only progress")
+            telegram("editMessageText", {**fields, "text": plain})
     except Exception:
         logging.exception("Could not update beat progress")
 
 
 def beat_progress(stage, action):
     # Blocks indicate completed and current stages, not a measured download percentage.
-    done = "🟩" * (4 * (stage - 1))
-    active = "🟨" * 4
-    waiting = "⬜" * (4 * (3 - stage))
+    done = "▰" * (4 * (stage - 1))
+    active = "▰" * 4
+    waiting = "▱" * (4 * (3 - stage))
     return f"🎧 Делаю биток\n\n{done}{active}{waiting}\n\n{action} · {stage}/3"
 
 
