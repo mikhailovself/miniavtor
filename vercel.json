@@ -1,7 +1,7 @@
 {
   "functions": {
     "api/webhook.ts": {
-      "maxDuration": 30
+      "maxDuration": 300
     }
   },
   "crons": [

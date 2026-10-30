@@ -21,11 +21,13 @@ test("broadcasts to private users, skips bans and reports delivery", async () =>
     if (cmd === "SISMEMBER") return key === "banned" && args[0] === "3" ? 1 : key === "users" ? 1 : 0;
     if (cmd === "SET") return "OK";
     if (cmd === "HGETALL") return active;
+    if (cmd === "LINDEX") return queue[0] ?? null;
+    if (cmd === "GET") return null;
     if (cmd === "LPOP") return queue.shift() ?? null;
     if (cmd === "LLEN") return queue.length;
     if (cmd === "HINCRBY") { active[args[0]] = String(Number(active[args[0]] || 0) + Number(args[1])); return active[args[0]]; }
     if (cmd === "HSET") { for (let i = 0; i < args.length; i += 2) active[args[i]] = args[i + 1]; return 1; }
-    if (cmd === "DEL") return 1;
+    if (cmd === "DEL" || cmd === "HDEL") return 1;
     throw new Error(`Unexpected Redis command: ${cmd}`);
   };
   const f = runInNewContext(`${code}\n({ broadcastRecipients, runBroadcast })`, {

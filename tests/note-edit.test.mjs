@@ -11,7 +11,7 @@ test('deleted note is purged, while edit replaces list items', async () => {
     const item = { id: '1', message: 1, chat: '-100', thread: 2, photo: false, note: { title: 'Покупки', body: '', items: [{ text: 'лук' }] } };
     const saved = [item];
     const apply = runInNewContext(`${code}\napplyNoteUpdate`, {
-      uniqueItems: x => x, formatNote: n => JSON.stringify(n), MAX_TEXT: 3900, MAX_CAPTION: 1000,
+      noteKeyboard: () => ({inline_keyboard:[]}), redis: async () => "OK", uniqueItems: x => x, formatNote: n => JSON.stringify(n), MAX_TEXT: 3900, MAX_CAPTION: 1000,
       tg: async (method, payload) => { calls.push(payload); return missing ? { ok: false, description: 'Bad Request: message to edit not found' } : { ok: true }; },
       redisPipe: async cmds => removed.push(...cmds), replaceReminder: async () => {}, rememberNote: async () => {},
     });

@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
+  "dependencies": {
+    "@vercel/functions": "^3.10.4"
+  },
   "devDependencies": {
     "@vercel/node": "^5.0.0",
     "typescript": "^5.6.0"

@@ -1,0 +1,5 @@
+{
+  "functions": {
+    "api/convert.py": { "maxDuration": 300 }
+  }
+}
