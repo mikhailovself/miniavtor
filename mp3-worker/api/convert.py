@@ -13,6 +13,7 @@ import subprocess
 import uuid
 
 import imageio_ffmpeg
+import deno
 import numpy as np
 import yt_dlp
 
@@ -133,12 +134,15 @@ def analyze(samples):
 
 def convert(url, chat_id):
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    deno_path = deno.find_deno_bin()
+    logging.warning("YouTube JS runtime: Deno available: %s", Path(deno_path).is_file())
     with TemporaryDirectory() as temp:
         cookie_file = load_youtube_cookies(temp)
         options = {
             "format": "bestaudio/best", "outtmpl": str(Path(temp) / "audio.%(ext)s"),
             "noplaylist": True, "quiet": True, "no_warnings": True,
             "ffmpeg_location": ffmpeg, "max_filesize": MAX_BYTES,
+            "js_runtimes": {"deno": {"path": deno_path}},
             "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
         }
         if cookie_file:
