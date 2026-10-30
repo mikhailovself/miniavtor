@@ -1,5 +1,5 @@
 {
   "functions": {
-    "api/convert.py": { "maxDuration": 300 }
+    "app.py": { "maxDuration": 300 }
   }
 }

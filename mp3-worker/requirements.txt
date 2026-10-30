@@ -1,3 +1,4 @@
 yt-dlp
 imageio-ffmpeg>=0.6.0
 numpy>=2.0,<3
+fastapi>=0.117.1

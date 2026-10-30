@@ -1,5 +1,4 @@
 """Single-video YouTube to MP3 worker, deployed as a separate Vercel project."""
-from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from urllib.parse import urlparse, parse_qs
@@ -8,7 +7,6 @@ import json
 import os
 import re
 import subprocess
-import traceback
 import uuid
 
 import imageio_ffmpeg
@@ -130,31 +128,3 @@ def convert(url, chat_id):
         telegram("sendAudio", {"chat_id": str(chat_id), "caption": f"{title}\n{copy_line}\nBPM и тональность определены автоматически.", "title": title}, mp3)
 
 
-class handler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        secret = os.environ.get("MP3_WORKER_SECRET", "")
-        if not secret or self.headers.get("Authorization") != f"Bearer {secret}":
-            self.send_error(401)
-            return
-        try:
-            size = int(self.headers.get("Content-Length", "0"))
-            if not 0 < size < 4096:
-                self.send_error(400)
-                return
-            payload = json.loads(self.rfile.read(size))
-            url, chat_id = payload.get("url"), payload.get("chat_id")
-            if not valid_youtube_url(url) or not isinstance(chat_id, int):
-                self.send_error(400)
-                return
-            try:
-                convert(url, chat_id)
-            except Exception as error:
-                traceback.print_exc()
-                message = str(error) if isinstance(error, ValueError) else "Не получилось скачать или обработать это видео. Попробуй другую ссылку позже."
-                telegram("sendMessage", {"chat_id": str(chat_id), "text": message[:300]})
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"ok")
-        except Exception:
-            traceback.print_exc()
-            self.send_error(500)
