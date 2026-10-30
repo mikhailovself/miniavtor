@@ -22,7 +22,7 @@ test("start menu leads to abilities, ordinary group and secretary", async () => 
   });
   const menu = await views.mainView({ id: "123" });
   const callbacks = menu.kb.inline_keyboard.flat().map((button) => button.callback_data);
-  assert.deepEqual(Array.from(callbacks), ["abilities", "groupadd", "secretary", "beat", "author", "personal"]);
+  assert.deepEqual(Array.from(callbacks), ["abilities", "groupadd", "secretary", "tools", "author", "personal"]);
   assert.equal(menu.kb.inline_keyboard[2][0].text, "👍 автор бота");
   assert.deepEqual(Array.from(menu.kb.inline_keyboard.slice(0, 3), row => row.length), [2, 2, 2]);
   assert.equal(menu.text, "<b>📋 Менюшка</b>\n\nНу че, куда?");
