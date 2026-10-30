@@ -4,6 +4,8 @@ from tempfile import TemporaryDirectory
 from urllib.parse import urlparse, parse_qs
 from urllib.request import Request, urlopen
 import base64
+import binascii
+import logging
 import json
 import os
 import re
@@ -24,6 +26,29 @@ MINOR = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.
 
 class BeatInputError(ValueError):
     pass
+
+
+def load_youtube_cookies(temp):
+    encoded = os.environ.get("YOUTUBE_COOKIES_BASE64", "").strip()
+    if not encoded:
+        logging.warning("YouTube cookies: YOUTUBE_COOKIES_BASE64 is not set in this deployment")
+        return None
+    try:
+        contents = base64.b64decode(encoded, validate=True)
+    except binascii.Error as error:
+        raise RuntimeError("YOUTUBE_COOKIES_BASE64 is not valid Base64") from error
+    if not contents.startswith((b"# Netscape HTTP Cookie File", b"# HTTP Cookie File")):
+        raise RuntimeError("YouTube cookies are not in Netscape cookies.txt format")
+    lines = contents.decode("utf-8", errors="replace").splitlines()
+    youtube_rows = [line for line in lines if not line.startswith("#") and line.startswith((".youtube.com\t", "youtube.com\t"))]
+    auth_names = {line.split("\t")[5] for line in youtube_rows if len(line.split("\t")) == 7}
+    logging.warning("YouTube cookies loaded: %d rows; login cookies present: %s", len(youtube_rows), bool(auth_names.intersection({"SID", "SAPISID", "__Secure-3PAPISID"})))
+    if not youtube_rows:
+        raise RuntimeError("No YouTube cookies found in YOUTUBE_COOKIES_BASE64")
+    path = Path(temp) / "youtube-cookies.txt"
+    path.write_bytes(contents)
+    path.chmod(0o600)
+    return path
 
 
 def valid_youtube_url(raw):
@@ -109,11 +134,7 @@ def analyze(samples):
 def convert(url, chat_id):
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     with TemporaryDirectory() as temp:
-        cookie_file = None
-        encoded_cookies = os.environ.get("YOUTUBE_COOKIES_BASE64", "").strip()
-        if encoded_cookies:
-            cookie_file = Path(temp) / "youtube-cookies.txt"
-            cookie_file.write_bytes(base64.b64decode(encoded_cookies, validate=True))
+        cookie_file = load_youtube_cookies(temp)
         options = {
             "format": "bestaudio/best", "outtmpl": str(Path(temp) / "audio.%(ext)s"),
             "noplaylist": True, "quiet": True, "no_warnings": True,
