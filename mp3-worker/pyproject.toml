@@ -1,2 +1,13 @@
+[project]
+name = "miniavtor-mp3-worker"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.117.1",
+  "yt-dlp",
+  "imageio-ffmpeg>=0.6.0",
+  "numpy>=2.0,<3",
+]
+
 [tool.vercel]
 entrypoint = "app:app"
