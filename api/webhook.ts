@@ -1736,9 +1736,9 @@ async function mainView(user: User): Promise<View> {
     text,
     kb: {
       inline_keyboard: [
-        [btn("🎧 Скачать биток", "beat"), btn("🗂 Секретарь", "secretary")],
-        [btn("👥 В группу", "groupadd"), btn("⚙️ Для себя", "personal")],
-        [btn("🤔 Чё я умею?", "abilities"), btn("🎤 Создатель", "author")],
+        [btn("🤔 Чё я умею?", "abilities"), btn("👥 Добавить в группу", "groupadd")],
+        [btn("🗂 автор.секретарь", "secretary"), btn("🎤 автор.создатель", "author")],
+        [btn("🎧 Скачать биток", "beat"), btn("⚙️ Для себя", "personal")],
         ...(liveTarget ? [[btn("⏹ Выйти из ручного диалога", `ld:${liveTarget}:0`)]] : []),
         ...(isOwner(user.id) ? [[btn("⚙️ Админ-панель", "adm")]] : []),
       ],

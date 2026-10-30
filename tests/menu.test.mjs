@@ -22,7 +22,7 @@ test("start menu leads to abilities, ordinary group and secretary", async () => 
   });
   const menu = await views.mainView({ id: "123" });
   const callbacks = menu.kb.inline_keyboard.flat().map((button) => button.callback_data);
-  assert.deepEqual(Array.from(callbacks), ["beat", "secretary", "groupadd", "personal", "abilities", "author"]);
+  assert.deepEqual(Array.from(callbacks), ["abilities", "groupadd", "secretary", "author", "beat", "personal"]);
   assert.deepEqual(Array.from(menu.kb.inline_keyboard.slice(0, 3), row => row.length), [2, 2, 2]);
   assert.match(menu.text, /Творчество и дела/);
   assert.match(views.abilitiesView().text, /тематическим папкам/);
