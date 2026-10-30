@@ -28,7 +28,7 @@ test("start menu leads to abilities, ordinary group and secretary", async () => 
   assert.equal(menu.kb.inline_keyboard[2][0].icon_custom_emoji_id, "5384084295465854839");
   assert.equal(menu.kb.inline_keyboard[2][0].text, "автор бота");
   assert.deepEqual(Array.from(menu.kb.inline_keyboard.slice(0, 3), row => row.length), [2, 2, 2]);
-  assert.match(menu.text, /Творчество и дела/);
+  assert.equal(menu.text, "<b>📋 Менюшка</b>\n\nНу че, куда?");
   assert.match(views.abilitiesView().text, /тематическим папкам/);
   assert.doesNotMatch(views.abilitiesView().text, /Смотрю и слушаю/);
   assert.match((await views.regularGroupView()).kb.inline_keyboard[0][0].url, /startgroup=chat/);

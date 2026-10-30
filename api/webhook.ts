@@ -1,7 +1,7 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { waitUntil } from "@vercel/functions";
 import { friendContext, isKnownFriend } from "./friends.js";
-import { decorateTelegramPayload } from "./emoji.js";
+import { animatedEmojiIds, decorateAnimatedEmoji } from "./animated-emoji.js";
 import {
   amendNote, cleanNote, dedupeNotes, esc, findSimilarSaved, formatNote, uniqueItems, MAX_CAPTION, MAX_TEXT,
   type Note, type NoteUpdate, type SavedNote,
@@ -155,20 +155,17 @@ const isOwner = (uid: string | number | undefined) => !!OWNER_ID && uid !== unde
 // ---------- Telegram ----------
 
 async function tg(method: string, payload: Record<string, unknown>) {
-  const decorated = decorateTelegramPayload(method, payload);
+  const canDecorate = /^(sendMessage|editMessageText|sendPhoto|sendVideo|sendAnimation|sendDocument|sendAudio|editMessageCaption|copyMessage|editMessageReplyMarkup)$/.test(method);
+  const decorated = canDecorate
+    ? decorateAnimatedEmoji(method, payload, await animatedEmojiIds(TELEGRAM_BOT_TOKEN)) : payload;
   const request = async (body: Record<string, unknown>) => {
     const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     });
-    return r.json();
+    return r.json() as Promise<any>;
   };
-  let data: any = await request(decorated);
-  if (!data.ok && data.error_code === 400 && decorated !== payload) {
-    console.warn("Telegram custom emoji rejected, retrying without decoration", method);
-    data = await request(payload);
-  }
+  let data = await request(decorated);
+  if (!data.ok && data.error_code === 400 && decorated !== payload) data = await request(payload);
   if (!data.ok) console.error("Telegram error", method, data);
   return data;
 }
@@ -1734,11 +1731,7 @@ const profileUrl = (username: string | undefined) => username && /^[A-Za-z0-9_]{
 const profileLink = (uid: string, username?: string) => profileUrl(username) ?? `tg://user?id=${uid}`;
 
 async function mainView(user: User): Promise<View> {
-  let text = "<b>📋 Менюшка</b>\n\n" +
-    "🎛 <b>Творчество и дела</b>\nБит, заметки, группа.\n" +
-    "────────────\n" +
-    "🙋 <b>Про меня и про тебя</b>\nВозможности, создатель, настройки.\n\n" +
-    "👇 Выбирай, что открыть:";
+  let text = "<b>📋 Менюшка</b>\n\nНу че, куда?";
   const liveTarget = isOwner(user.id) ? String((await redis(["GET", "live:owner"])) ?? "") : "";
   if (liveTarget) text += `\n\n⚠️ <b>Ты сейчас лично отвечаешь пользователю ${esc(liveTarget)}.</b>\nЛюбое обычное сообщение сюда уйдёт ему.\n🚪 /stoplive — выйти.`;
 

@@ -3,6 +3,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory, gettempdir
 from urllib.parse import urlparse, parse_qs
 from urllib.request import Request, urlopen
+from concurrent.futures import ThreadPoolExecutor
 import base64
 import binascii
 import hashlib
@@ -162,18 +163,52 @@ def telegram(method, fields, file_path=None):
     return result.get("result")
 
 
+_progress_emoji_ids = None
+
+
+def progress_emoji_ids():
+    global _progress_emoji_ids
+    if _progress_emoji_ids is not None:
+        return _progress_emoji_ids
+    token = os.environ["TELEGRAM_BOT_TOKEN"]
+    names = ("NewsEmoji", "SignsEmoji", "HeartsEmoji", "WaterworldEmoji", "AnimatedAsianEmoji", "GummyBearEmoji")
+
+    def fetch_set(name):
+        try:
+            body = json.dumps({"name": name}).encode()
+            request = Request(f"https://api.telegram.org/bot{token}/getStickerSet", data=body,
+                              headers={"Content-Type": "application/json"}, method="POST")
+            with urlopen(request, timeout=3) as response:
+                data = json.load(response)
+            result = data.get("result") or {}
+            return result.get("stickers", []) if result.get("sticker_type") == "custom_emoji" else []
+        except Exception:
+            return []
+
+    with ThreadPoolExecutor(max_workers=len(names)) as pool:
+        sets = list(pool.map(fetch_set, names))
+    ids = {}
+    for stickers in sets:
+        for sticker in stickers:
+            emoji = sticker.get("emoji")
+            if (sticker.get("type") == "custom_emoji" and emoji and sticker.get("custom_emoji_id")
+                    and (sticker.get("is_animated") or sticker.get("is_video"))
+                    and not sticker.get("needs_repainting")):
+                ids.setdefault(emoji, sticker["custom_emoji_id"])
+    _progress_emoji_ids = ids
+    return ids
+
+
 def update_progress(chat_id, message_id, text):
     if not message_id:
         return
     try:
-        emoji_ids = {"🎧": "6007938409857815902", "🎛": "5936170807716745162", "📤": "5433614747381538714"}
         fields = {"chat_id": str(chat_id), "message_id": message_id, "text": text}
-        animated = text
-        for emoji, emoji_id in emoji_ids.items():
-            animated = animated.replace(emoji, f'<tg-emoji emoji-id="{emoji_id}">{emoji}</tg-emoji>')
-        if animated != text:
+        emoji = text[:2].strip()
+        emoji_id = progress_emoji_ids().get(emoji)
+        if emoji_id:
             try:
-                telegram("editMessageText", {**fields, "text": animated, "parse_mode": "HTML"})
+                telegram("editMessageText", {**fields, "text": text.replace(emoji, f'<tg-emoji emoji-id="{emoji_id}">{emoji}</tg-emoji>', 1), "parse_mode": "HTML"})
                 return
             except Exception:
                 logging.warning("Animated progress emoji unavailable; using normal emoji")
