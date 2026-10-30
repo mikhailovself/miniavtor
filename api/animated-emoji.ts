@@ -1,6 +1,11 @@
 // Public packs listed as animated in the CustomEmojiPacks directory.
 // Sticker metadata is read from Telegram's Bot API; static and adaptive icons are excluded.
-const PACKS = ["NewsEmoji", "SignsEmoji", "HeartsEmoji", "WaterworldEmoji", "AnimatedAsianEmoji", "GummyBearEmoji"];
+import { EMOJI_CANDIDATES } from "./emoji-candidates.js";
+const PACKS = [
+  "FluentEmojiSet1", "FluentEmojiSet2", "FluentEmojiSet3", "FluentEmojiSet4", "FluentEmojiSet5",
+  "RestrictedEmoji", "NewsEmoji", "SignsEmoji", "HeartsEmoji", "WaterworldEmoji",
+  "AnimatedAsianEmoji", "GummyBearEmoji", "ApplicationEmoji", "SparklesEmoji",
+];
 const segmenter = new Intl.Segmenter("ru", { granularity: "grapheme" });
 type Payload = Record<string, any>;
 type Sticker = { type?: string; emoji?: string; custom_emoji_id?: string; is_animated?: boolean; is_video?: boolean; needs_repainting?: boolean };
@@ -12,19 +17,39 @@ export async function animatedEmojiIds(token: string): Promise<Map<string, strin
   if (cached && Date.now() < expires) return cached;
   expires = Date.now() + 3000;
   cached = (async () => {
-    const sets = await Promise.all(PACKS.map(async name => {
+    const setsPromise = Promise.all(PACKS.map(async name => {
       try {
         const response = await fetch(`https://api.telegram.org/bot${token}/getStickerSet`, {
           method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name }), signal: AbortSignal.timeout(2500),
+          body: JSON.stringify({ name }), signal: AbortSignal.timeout(5000),
         });
         const data: any = await response.json();
         return data.ok && data.result?.sticker_type === "custom_emoji" ? data.result.stickers as Sticker[] : [];
       } catch { return [] as Sticker[]; }
     }));
+    const candidatesPromise = (async (): Promise<Sticker[]> => {
+      try {
+        const custom_emoji_ids = [...new Set(Object.values(EMOJI_CANDIDATES).flat())];
+        const response = await fetch(`https://api.telegram.org/bot${token}/getCustomEmojiStickers`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ custom_emoji_ids }), signal: AbortSignal.timeout(5000),
+        });
+        const data: any = await response.json();
+        return data.ok && Array.isArray(data.result) ? data.result as Sticker[] : [];
+      } catch { return []; }
+    })();
+    const sets = await setsPromise;
+    const candidates = await candidatesPromise;
     const ids = new Map<string, string>();
     for (const sticker of sets.flat()) {
       if (sticker.type === "custom_emoji" && sticker.emoji && sticker.custom_emoji_id &&
+          (sticker.is_animated || sticker.is_video) && !sticker.needs_repainting && !ids.has(sticker.emoji)) {
+        ids.set(sticker.emoji, sticker.custom_emoji_id);
+      }
+    }
+    for (const sticker of candidates) {
+      if (sticker.type === "custom_emoji" && sticker.emoji && sticker.custom_emoji_id &&
+          EMOJI_CANDIDATES[sticker.emoji]?.includes(sticker.custom_emoji_id) &&
           (sticker.is_animated || sticker.is_video) && !sticker.needs_repainting && !ids.has(sticker.emoji)) {
         ids.set(sticker.emoji, sticker.custom_emoji_id);
       }

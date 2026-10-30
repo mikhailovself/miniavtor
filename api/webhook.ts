@@ -3766,7 +3766,7 @@ async function handlePrivate(msg: any) {
     if (!mp3Url) { await send("🔗 Нужна ссылка на одно видео YouTube. Попробуй ещё раз."); return; }
     if (beatWaiting) await redis(["DEL", `st:${uid}`]);
     if (!MP3_WORKER_URL || !MP3_WORKER_SECRET) { await send("⚙️ Конвертация пока не настроена. Напиши админу бота."); return; }
-    const progress = await send("🎧 Готовлю бит\n▱▱▱ 0/3");
+    const progress = await send("🎧 Делаю биток\n\n⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜\n\n⏳ Подключаюсь к конвертеру");
     const statusMessageId = progress.ok ? progress.result?.message_id : undefined;
     if (statusMessageId) await closeMenuView(chatId);
     waitUntil((async () => {

@@ -171,14 +171,16 @@ def progress_emoji_ids():
     if _progress_emoji_ids is not None:
         return _progress_emoji_ids
     token = os.environ["TELEGRAM_BOT_TOKEN"]
-    names = ("NewsEmoji", "SignsEmoji", "HeartsEmoji", "WaterworldEmoji", "AnimatedAsianEmoji", "GummyBearEmoji")
+    names = ("FluentEmojiSet1", "FluentEmojiSet2", "FluentEmojiSet3", "FluentEmojiSet4", "FluentEmojiSet5",
+             "RestrictedEmoji", "NewsEmoji", "SignsEmoji", "HeartsEmoji", "WaterworldEmoji",
+             "AnimatedAsianEmoji", "GummyBearEmoji", "ApplicationEmoji", "SparklesEmoji")
 
     def fetch_set(name):
         try:
             body = json.dumps({"name": name}).encode()
             request = Request(f"https://api.telegram.org/bot{token}/getStickerSet", data=body,
                               headers={"Content-Type": "application/json"}, method="POST")
-            with urlopen(request, timeout=3) as response:
+            with urlopen(request, timeout=5) as response:
                 data = json.load(response)
             result = data.get("result") or {}
             return result.get("stickers", []) if result.get("sticker_type") == "custom_emoji" else []
@@ -215,6 +217,14 @@ def update_progress(chat_id, message_id, text):
         telegram("editMessageText", fields)
     except Exception:
         logging.exception("Could not update beat progress")
+
+
+def beat_progress(stage, action):
+    # Blocks indicate completed and current stages, not a measured download percentage.
+    done = "🟩" * (4 * (stage - 1))
+    active = "🟨" * 4
+    waiting = "⬜" * (4 * (3 - stage))
+    return f"🎧 Делаю биток\n\n{done}{active}{waiting}\n\n{action} · {stage}/3"
 
 
 def audio_samples(mp3, ffmpeg):
@@ -347,21 +357,21 @@ def convert(url, chat_id, status_message_id=None):
                 raise BeatInputError("Пока беру только видео до 10 минут.")
             if (info.get("filesize") or info.get("filesize_approx") or 0) > MAX_BYTES:
                 raise BeatInputError("Файл слишком большой для Telegram.")
-            update_progress(chat_id, status_message_id, "🎧 Скачиваю аудио\n▰▱▱ 1/3")
+            update_progress(chat_id, status_message_id, beat_progress(1, "⬇️ Скачиваю аудио"))
             # The resolved info already contains the selected format and URL.
             # Re-extracting the YouTube page repeats its JS challenge.
             downloader.process_info(info)
         mp3 = Path(temp) / "audio.mp3"
         if not mp3.exists() or mp3.stat().st_size > MAX_BYTES:
             raise BeatInputError("MP3 получился слишком большим для Telegram.")
-        update_progress(chat_id, status_message_id, "🎛 Определяю BPM и тональность\n▰▰▱ 2/3")
+        update_progress(chat_id, status_message_id, beat_progress(2, "🎛 Определяю BPM и тональность"))
         bpm, key = analyze(audio_samples(mp3, ffmpeg))
         title = short_title(info.get("title"))
         set_mp3_tags(mp3, ffmpeg, title)
         if mp3.stat().st_size > MAX_BYTES:
             raise BeatInputError("MP3 получился слишком большим для Telegram.")
         copy_line = f"{bpm or '?'} BPM | {key}"
-        update_progress(chat_id, status_message_id, "📤 Отправляю MP3\n▰▰▰ 3/3")
+        update_progress(chat_id, status_message_id, beat_progress(3, "📤 Отправляю MP3"))
         telegram("sendAudio", {
             "chat_id": str(chat_id), "title": title, "performer": "@mini_avtor_bot",
             "caption": f"<code>{copy_line}</code>", "parse_mode": "HTML",

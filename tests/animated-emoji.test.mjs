@@ -1,19 +1,34 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { animatedEmojiIds, decorateAnimatedEmoji } from "../api/animated-emoji.ts";
+import { readFileSync } from "node:fs";
+import { stripTypeScriptTypes } from "node:module";
+import { runInNewContext } from "node:vm";
+import { EMOJI_CANDIDATES } from "../api/emoji-candidates.ts";
+
+const source = readFileSync(new URL("../api/animated-emoji.ts", import.meta.url), "utf8")
+  .replace(/^import .*\n/gm, "").replace(/^export /gm, "");
+const { animatedEmojiIds, decorateAnimatedEmoji } = runInNewContext(
+  `${stripTypeScriptTypes(source)}\n({ animatedEmojiIds, decorateAnimatedEmoji })`,
+  { EMOJI_CANDIDATES, Intl, Map, Set, Date, Promise, AbortSignal, console,
+    fetch: (...args) => globalThis.fetch(...args) },
+);
 
 test("Telegram pack loader accepts only colored animated custom emoji with exact alt", async () => {
   const previous = globalThis.fetch;
-  globalThis.fetch = async () => ({ json: async () => ({ ok: true, result: {
-    sticker_type: "custom_emoji", stickers: [
+  globalThis.fetch = async (url) => ({ json: async () => url.endsWith("getCustomEmojiStickers")
+    ? { ok: true, result: [
+      { type: "custom_emoji", emoji: "🗂", custom_emoji_id: "5431736674147114227", is_animated: true },
+      { type: "custom_emoji", emoji: "📋", custom_emoji_id: "456", is_animated: true },
+    ] }
+    : { ok: true, result: { sticker_type: "custom_emoji", stickers: [
       { type: "custom_emoji", emoji: "🎧", custom_emoji_id: "123", is_animated: true },
       { type: "custom_emoji", emoji: "📋", custom_emoji_id: "456", is_animated: false },
       { type: "custom_emoji", emoji: "⚙️", custom_emoji_id: "789", is_video: true, needs_repainting: true },
-    ],
-  } }) });
+    ] } } });
   try {
     const ids = await animatedEmojiIds("test-token");
     assert.equal(ids.get("🎧"), "123");
+    assert.equal(ids.get("🗂"), "5431736674147114227");
     assert.equal(ids.has("📋"), false);
     assert.equal(ids.has("⚙️"), false);
   } finally { globalThis.fetch = previous; }
