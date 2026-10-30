@@ -14,6 +14,7 @@ import platform
 import re
 import shutil
 import subprocess
+import time
 import uuid
 
 os.environ.setdefault("NUMBA_CACHE_DIR", str(Path(gettempdir()) / "miniavtor-numba"))
@@ -206,13 +207,15 @@ def update_progress(chat_id, message_id, text):
         return
     try:
         ids = progress_emoji_ids()
-        emoji = ("🎧", "⬇️", "🎛", "📤")
+        emoji = ("🎶", "⬇️", "🎛", "📤")
         pattern = re.compile("|".join(map(re.escape, emoji)))
-        plain = pattern.sub("", text)
-        animated = pattern.sub(lambda match: (
+        tidy = lambda value: re.sub(r"(?m)^ +", "", value)
+        # Без HTML-тегов и без эмодзи: запасной вариант, если анимированные недоступны.
+        plain = tidy(re.sub(r"</?b>", "", pattern.sub("", text)))
+        animated = tidy(pattern.sub(lambda match: (
             f'<tg-emoji emoji-id="{ids[match.group()]}">{match.group()}</tg-emoji>'
             if match.group() in ids else ""
-        ), text)
+        ), text))
         fields = {"chat_id": str(chat_id), "message_id": message_id}
         try:
             telegram("editMessageText", {**fields, "text": animated, "parse_mode": "HTML"})
@@ -223,12 +226,20 @@ def update_progress(chat_id, message_id, text):
         logging.exception("Could not update beat progress")
 
 
-def beat_progress(stage, action):
-    # Blocks indicate completed and current stages, not a measured download percentage.
-    done = "▰" * (4 * (stage - 1))
-    active = "▰" * 4
-    waiting = "▱" * (4 * (3 - stage))
-    return f"🎧 Делаю биток\n\n{done}{active}{waiting}\n\n{action} · {stage}/3"
+BAR_WIDTH = 10
+
+
+def progress_bar(percent):
+    percent = max(0, min(100, int(percent)))
+    filled = round(BAR_WIDTH * percent / 100)
+    # Цвет заливки меняется по ходу работы: оранжевый, жёлтый, зелёный.
+    color = "🟧" if percent < 40 else "🟨" if percent < 75 else "🟩"
+    return color * filled + "⬜" * (BAR_WIDTH - filled) + f"  {percent}%"
+
+
+def beat_progress(stage, action, percent):
+    # Процент скачивания реальный (по байтам), остальные этапы идут по фиксированным отметкам.
+    return f"🎶 <b>Делаю биток</b>\n\n{progress_bar(percent)}\n\n{action} · {stage}/3"
 
 
 def audio_samples(mp3, ffmpeg):
@@ -342,13 +353,30 @@ def set_mp3_tags(mp3, ffmpeg, title):
 def convert(url, chat_id, status_message_id=None):
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     js_runtimes = javascript_runtime()
+    shown = {"at": 0.0, "percent": -10}
+
+    def on_download(info_dict):
+        # Скачивание занимает шкалу от 4% до 60%. Правки сообщения редкие, чтобы не упереться в лимиты Telegram.
+        if info_dict.get("status") != "downloading":
+            return
+        total = info_dict.get("total_bytes") or info_dict.get("total_bytes_estimate")
+        done = info_dict.get("downloaded_bytes")
+        if not total or not done:
+            return
+        percent = min(60, 4 + int(56 * done / total))
+        now = time.monotonic()
+        if percent - shown["percent"] < 3 or now - shown["at"] < 1.5:
+            return
+        shown.update(at=now, percent=percent)
+        update_progress(chat_id, status_message_id, beat_progress(1, "⬇️ Скачиваю аудио", percent))
+
     with TemporaryDirectory() as temp:
         cookie_file = load_youtube_cookies(temp)
         options = {
             "format": "bestaudio/best", "outtmpl": str(Path(temp) / "audio.%(ext)s"),
             "noplaylist": True, "quiet": True, "no_warnings": True,
             "ffmpeg_location": ffmpeg, "max_filesize": MAX_BYTES,
-            "js_runtimes": js_runtimes,
+            "js_runtimes": js_runtimes, "progress_hooks": [on_download],
             "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
         }
         if cookie_file:
@@ -361,14 +389,14 @@ def convert(url, chat_id, status_message_id=None):
                 raise BeatInputError("Пока беру только видео до 10 минут.")
             if (info.get("filesize") or info.get("filesize_approx") or 0) > MAX_BYTES:
                 raise BeatInputError("Файл слишком большой для Telegram.")
-            update_progress(chat_id, status_message_id, beat_progress(1, "⬇️ Скачиваю аудио"))
+            update_progress(chat_id, status_message_id, beat_progress(1, "⬇️ Скачиваю аудио", 4))
             # The resolved info already contains the selected format and URL.
             # Re-extracting the YouTube page repeats its JS challenge.
             downloader.process_info(info)
         mp3 = Path(temp) / "audio.mp3"
         if not mp3.exists() or mp3.stat().st_size > MAX_BYTES:
             raise BeatInputError("MP3 получился слишком большим для Telegram.")
-        update_progress(chat_id, status_message_id, beat_progress(2, "🎛 Определяю BPM и тональность"))
+        update_progress(chat_id, status_message_id, beat_progress(2, "🎛 Определяю BPM и тональность", 65))
         bpm, key = analyze(audio_samples(mp3, ffmpeg))
         title = short_title(info.get("title"))
         set_mp3_tags(mp3, ffmpeg, title)
@@ -376,7 +404,7 @@ def convert(url, chat_id, status_message_id=None):
             raise BeatInputError("MP3 получился слишком большим для Telegram.")
         # Две отдельные code-сущности: по тапу копируется либо BPM, либо тональность, а «|» не копируется.
         copy_line = f"<code>{bpm or '?'} BPM</code> | <code>{key}</code>"
-        update_progress(chat_id, status_message_id, beat_progress(3, "📤 Отправляю MP3"))
+        update_progress(chat_id, status_message_id, beat_progress(3, "📤 Отправляю MP3", 92))
         telegram("sendAudio", {
             "chat_id": str(chat_id), "title": title, "performer": "@mini_avtor_bot",
             "caption": copy_line, "parse_mode": "HTML",
