@@ -1,7 +1,7 @@
 """Single-video YouTube to MP3 worker, deployed as a separate Vercel project."""
 from pathlib import Path
 from tempfile import TemporaryDirectory, gettempdir
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 from urllib.request import Request, urlopen
 from concurrent.futures import ThreadPoolExecutor
 import base64
@@ -357,17 +357,137 @@ def set_mp3_tags(mp3, ffmpeg, title):
     tagged.replace(mp3)
 
 
+BROWSER_UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+API_LINK_KEYS = {"download_url", "downloadurl", "download", "file", "link", "mp3", "audio_url", "audiourl", "dlink"}
+API_JOB_KEYS = {"id", "job_id", "jobid", "guid", "task_id"}
+API_POLL_SECONDS = 150
+API_DOWNLOAD_SECONDS = 90
+
+
+def rapidapi_configured():
+    return bool(os.environ.get("RAPIDAPI_KEY") and os.environ.get("RAPIDAPI_START_URL"))
+
+
+def _search_json(data, keys, want_link=False):
+    """Ищет первое подходящее значение по именам ключей в произвольном JSON."""
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if str(key).lower() in keys:
+                if want_link:
+                    if isinstance(value, str) and value.startswith(("http://", "https://")):
+                        return value
+                elif value not in (None, "", [], {}):
+                    return value
+        for value in data.values():
+            found = _search_json(value, keys, want_link)
+            if found is not None:
+                return found
+    elif isinstance(data, list):
+        for value in data:
+            found = _search_json(value, keys, want_link)
+            if found is not None:
+                return found
+    return None
+
+
+def rapidapi_request(endpoint):
+    api_host = urlparse(os.environ["RAPIDAPI_START_URL"]).hostname
+    headers = dict(BROWSER_UA)
+    # Ключ отправляется только на хост RapidAPI: ссылка прогресса может вести на другой домен.
+    if urlparse(endpoint).hostname == api_host:
+        headers["x-rapidapi-key"] = os.environ["RAPIDAPI_KEY"]
+        headers["x-rapidapi-host"] = os.environ.get("RAPIDAPI_HOST") or api_host
+    with urlopen(Request(endpoint, headers=headers), timeout=30) as response:
+        return json.load(response)
+
+
+def youtube_title(url):
+    try:
+        endpoint = "https://www.youtube.com/oembed?format=json&url=" + quote(url, safe="")
+        with urlopen(Request(endpoint, headers=BROWSER_UA), timeout=8) as response:
+            return json.load(response).get("title")
+    except Exception:
+        return None
+
+
+def audio_duration(path, ffmpeg):
+    result = subprocess.run([ffmpeg, "-i", str(path)], capture_output=True, text=True, timeout=20)
+    match = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", result.stderr)
+    if not match:
+        return None
+    return int(match.group(1)) * 3600 + int(match.group(2)) * 60 + float(match.group(3))
+
+
+def is_mp3(path):
+    with open(path, "rb") as source:
+        head = source.read(3)
+    return head[:3] == b"ID3" or (len(head) >= 2 and head[0] == 0xFF and head[1] & 0xE0 == 0xE0)
+
+
+def download_via_rapidapi(url, temp, mp3, ffmpeg, report):
+    """Берёт MP3 у стороннего API. Возвращает {"title": ...}; при сбое бросает исключение."""
+    start_template = os.environ["RAPIDAPI_START_URL"]
+    progress_template = os.environ.get("RAPIDAPI_PROGRESS_URL", "")
+    data = rapidapi_request(start_template.replace("{url}", quote(url, safe="")))
+    title = _search_json(data, {"title"})
+    job = _search_json(data, API_JOB_KEYS)
+    link = _search_json(data, API_LINK_KEYS, want_link=True)
+    # API сам отдаёт готовую ссылку на проверку статуса (progress_url); шаблон из env нужен только как запасной.
+    next_url = _search_json(data, {"progress_url"}, want_link=True)
+    deadline = time.monotonic() + API_POLL_SECONDS
+    while not link:
+        if next_url:
+            endpoint = next_url
+        elif progress_template and job is not None:
+            endpoint = progress_template.replace("{id}", quote(str(job), safe=""))
+        else:
+            raise RuntimeError(f"RapidAPI returned no download link: {json.dumps(data, ensure_ascii=False)[:300]}")
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"RapidAPI did not finish in time: {json.dumps(data, ensure_ascii=False)[:300]}")
+        time.sleep(2)
+        data = rapidapi_request(endpoint)
+        title = title or _search_json(data, {"title"})
+        link = _search_json(data, API_LINK_KEYS, want_link=True)
+        next_url = _search_json(data, {"progress_url"}, want_link=True) or next_url
+
+    source = Path(temp) / "api-audio"
+    started = time.monotonic()
+    with urlopen(Request(link, headers=BROWSER_UA), timeout=60) as response, source.open("wb") as out:
+        total = int(response.headers.get("Content-Length") or 0)
+        done = 0
+        while True:
+            chunk = response.read(256 * 1024)
+            if not chunk:
+                break
+            done += len(chunk)
+            if done > MAX_BYTES:
+                raise BeatInputError("Файл слишком большой для Telegram.")
+            if time.monotonic() - started > API_DOWNLOAD_SECONDS:
+                raise RuntimeError("RapidAPI file download timed out")
+            out.write(chunk)
+            report(done, total)
+    if done < 1024:
+        raise RuntimeError("RapidAPI returned an empty file")
+
+    if is_mp3(source):
+        source.replace(mp3)
+    else:
+        subprocess.run([
+            ffmpeg, "-v", "error", "-y", "-i", str(source), "-vn",
+            "-c:a", "libmp3lame", "-b:a", "192k", str(mp3),
+        ], capture_output=True, timeout=120, check=True)
+    duration = audio_duration(mp3, ffmpeg)
+    if duration and duration > MAX_DURATION + 5:
+        raise BeatInputError("Пока беру только видео до 10 минут.")
+    return {"title": title if isinstance(title, str) and title.strip() else youtube_title(url)}
+
+
 def convert(url, chat_id, status_message_id=None):
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    js_runtimes = javascript_runtime()
     shown = {"at": 0.0, "percent": -10}
 
-    def on_download(info_dict):
+    def report_download(done, total):
         # Скачивание занимает шкалу от 4% до 60%. Правки сообщения редкие, чтобы не упереться в лимиты Telegram.
-        if info_dict.get("status") != "downloading":
-            return
-        total = info_dict.get("total_bytes") or info_dict.get("total_bytes_estimate")
-        done = info_dict.get("downloaded_bytes")
         if not total or not done:
             return
         percent = min(60, 4 + int(56 * done / total))
@@ -377,30 +497,52 @@ def convert(url, chat_id, status_message_id=None):
         shown.update(at=now, percent=percent)
         update_progress(chat_id, status_message_id, beat_progress(1, "⬇️ Скачиваю аудио", percent))
 
+    def on_download(info_dict):
+        if info_dict.get("status") != "downloading":
+            return
+        report_download(info_dict.get("downloaded_bytes"),
+                        info_dict.get("total_bytes") or info_dict.get("total_bytes_estimate"))
+
     with TemporaryDirectory() as temp:
-        cookie_file = load_youtube_cookies(temp)
-        options = {
-            "format": "bestaudio/best", "outtmpl": str(Path(temp) / "audio.%(ext)s"),
-            "noplaylist": True, "quiet": True, "no_warnings": True,
-            "ffmpeg_location": ffmpeg, "max_filesize": MAX_BYTES,
-            "js_runtimes": js_runtimes, "progress_hooks": [on_download],
-            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
-        }
-        if cookie_file:
-            options["cookiefile"] = str(cookie_file)
-        with yt_dlp.YoutubeDL(options) as downloader:
-            info = downloader.extract_info(url, download=False)
-            if not info or info.get("_type") == "playlist":
-                raise BeatInputError("Нужна ссылка на одно видео.")
-            if not info.get("duration") or info["duration"] > MAX_DURATION:
-                raise BeatInputError("Пока беру только видео до 10 минут.")
-            if (info.get("filesize") or info.get("filesize_approx") or 0) > MAX_BYTES:
-                raise BeatInputError("Файл слишком большой для Telegram.")
-            update_progress(chat_id, status_message_id, beat_progress(1, "⬇️ Скачиваю аудио", 4))
-            # The resolved info already contains the selected format and URL.
-            # Re-extracting the YouTube page repeats its JS challenge.
-            downloader.process_info(info)
         mp3 = Path(temp) / "audio.mp3"
+        info = None
+        # Сначала сторонний API (с датацентрового IP Vercel YouTube блокирует yt-dlp),
+        # при любом сбое пробуем прежний путь через yt-dlp.
+        if rapidapi_configured():
+            update_progress(chat_id, status_message_id, beat_progress(1, "⬇️ Скачиваю аудио", 4))
+            try:
+                info = download_via_rapidapi(url, temp, mp3, ffmpeg, report_download)
+                logging.warning("Audio fetched via RapidAPI")
+            except BeatInputError:
+                raise
+            except Exception:
+                logging.exception("RapidAPI download failed; falling back to yt-dlp")
+                mp3.unlink(missing_ok=True)
+                info = None
+        if info is None:
+            js_runtimes = javascript_runtime()
+            cookie_file = load_youtube_cookies(temp)
+            options = {
+                "format": "bestaudio/best", "outtmpl": str(Path(temp) / "audio.%(ext)s"),
+                "noplaylist": True, "quiet": True, "no_warnings": True,
+                "ffmpeg_location": ffmpeg, "max_filesize": MAX_BYTES,
+                "js_runtimes": js_runtimes, "progress_hooks": [on_download],
+                "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
+            }
+            if cookie_file:
+                options["cookiefile"] = str(cookie_file)
+            with yt_dlp.YoutubeDL(options) as downloader:
+                info = downloader.extract_info(url, download=False)
+                if not info or info.get("_type") == "playlist":
+                    raise BeatInputError("Нужна ссылка на одно видео.")
+                if not info.get("duration") or info["duration"] > MAX_DURATION:
+                    raise BeatInputError("Пока беру только видео до 10 минут.")
+                if (info.get("filesize") or info.get("filesize_approx") or 0) > MAX_BYTES:
+                    raise BeatInputError("Файл слишком большой для Telegram.")
+                update_progress(chat_id, status_message_id, beat_progress(1, "⬇️ Скачиваю аудио", 4))
+                # The resolved info already contains the selected format and URL.
+                # Re-extracting the YouTube page repeats its JS challenge.
+                downloader.process_info(info)
         if not mp3.exists() or mp3.stat().st_size > MAX_BYTES:
             raise BeatInputError("MP3 получился слишком большим для Telegram.")
         update_progress(chat_id, status_message_id, beat_progress(2, "🎛 Определяю BPM и тональность", 65))
@@ -421,5 +563,3 @@ def convert(url, chat_id, status_message_id=None):
                 telegram("deleteMessage", {"chat_id": str(chat_id), "message_id": status_message_id})
             except Exception:
                 logging.exception("Could not remove beat progress")
-
-
