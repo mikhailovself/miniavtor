@@ -43,13 +43,13 @@ test('duplicates do not bias randomness and candidate list is bounded', () => {
 test('test handler records only successful deliveries and bounds Redis history', async () => {
   const source = readFileSync(new URL('../api/webhook.ts', import.meta.url), 'utf8');
   const start = source.indexOf('    if (state?.action === "gifka_test")');
-  const end = source.indexOf('    if (state?.action === "broadcast")', start);
+  const end = source.indexOf('    // End of shared beta test.', start);
   assert.ok(start > 0 && end > start);
   for (const success of [false, true]) {
     const writes = [];
     const messages = [];
     const { run } = runInNewContext(`${stripTypeScriptTypes(`async function run() { ${source.slice(start, end)} }`)}\n({ run })`, {
-      state: { action: 'gifka_test' }, text: 'ну и дела', chatId: 42,
+      state: { action: 'gifka_test' }, text: 'ну и дела', chatId: 42, uid: '42', checkLimit: async () => ({ ok: true }),
       runLLM: async () => ({ reply: 'удивление' }), CHAT_DECLARATION: {},
       URLSearchParams, process: { env: {} }, console, gifkaCandidates, chooseGifka,
       fetchT: async () => ({ ok: true, json: async () => ({ items: [

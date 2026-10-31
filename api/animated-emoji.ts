@@ -125,16 +125,22 @@ const ALTERNATIVE_GROUPS = [
   "😎 😏 🤪 😁 😂 🤣 😊 🤡 🗿 👋", "😐 🤨 🥱 😭 💀 🌚 🥴 😈", "✨ ⭐ 🌟 💫",
 ].map(group => group.split(" "));
 
+// These two catalog glyphs looked motionless in the deployed UI despite their metadata.
+// Use different symbols; do not select their old assets again, including from the cache.
+const UI_ICON_REPLACEMENTS: Record<string, string> = { "🛠": "⚙", "🎞": "🎬" };
 function animatedIcon(emoji: string, ids: Map<string, string>): { emoji: string; id: string } {
-  const exact = ids.get(norm(emoji));
-  if (exact) return { emoji, id: exact };
-  const alternatives = ALTERNATIVE_GROUPS.find(group => group.includes(norm(emoji))) ?? [];
+  const requested = norm(emoji);
+  const preferred = UI_ICON_REPLACEMENTS[requested] ?? requested;
+  const allowed = (value: string) => !Object.hasOwn(UI_ICON_REPLACEMENTS, value);
+  const exact = ids.get(preferred);
+  if (exact) return { emoji: preferred === requested ? emoji : preferred, id: exact };
+  const alternatives = ALTERNATIVE_GROUPS.find(group => group.includes(preferred)) ?? [];
   for (const alt of [...alternatives, "✨", "⭐", "💫", "💬", "👉"]) {
     const id = ids.get(alt);
-    if (id) return { emoji: alt, id };
+    if (id && allowed(alt)) return { emoji: alt, id };
   }
   // A verified decorative icon is preferable to silently losing the intended icon.
-  const first = ids.entries().next().value;
+  const first = [...ids].find(([value]) => allowed(value));
   if (first) return { emoji: first[0], id: first[1] };
   throw new Error("ANIMATED_EMOJI_UNAVAILABLE: no verified animated icons; refusing static or missing icons");
 }
@@ -221,7 +227,7 @@ export function decorateAnimatedEmoji(method: string, original: Payload, ids: Ma
   const keyboard = original.reply_markup;
   const rows = keyboard?.inline_keyboard ?? keyboard?.keyboard;
   if (Array.isArray(rows)) {
-    const verifiedIds = new Set(ids.values());
+    const verifiedIds = new Set([...ids].filter(([emoji]) => !Object.hasOwn(UI_ICON_REPLACEMENTS, emoji)).map(([, id]) => id));
     const decorated = rows.map((row: any[]) => row.map(originalButton => {
       const button = typeof originalButton === "string" ? { text: originalButton } : originalButton;
       if (typeof button.text !== "string") return button;

@@ -169,6 +169,25 @@ test("unknown emoji get animated alternatives and reply keyboard keeps icons", (
   assert.equal(result.reply_markup.keyboard[0][0].icon_custom_emoji_id, "456");
 });
 
+test("tools and circle use replacement animations even when old glyphs are in the cache", () => {
+  const ids = new Map([["🛠", "old-tools"], ["🎞", "old-circle"], ["⚙", "gear"], ["🎬", "clapper"]]);
+  const result = decorateAnimatedEmoji("sendMessage", {
+    text: "🛠️ Инструменты 🎞 Кружок", reply_markup: { inline_keyboard: [[
+      { text: "🛠 Инструменты", callback_data: "tools", style: "success" },
+      { text: "🎞️ Кружок", callback_data: "circle", icon_custom_emoji_id: "old-circle" },
+      { text: "Назад", callback_data: "menu", style: "danger" },
+    ]] },
+  }, ids);
+  assert.equal(result.text, "⚙ Инструменты 🎬 Кружок");
+  assert.deepEqual(Array.from(result.entities, item => item.custom_emoji_id), ["gear", "clapper"]);
+  assert.equal(result.reply_markup.inline_keyboard[0][0].icon_custom_emoji_id, "gear");
+  assert.equal(result.reply_markup.inline_keyboard[0][0].style, "success");
+  assert.equal(result.reply_markup.inline_keyboard[0][1].icon_custom_emoji_id, "clapper");
+  assert.equal(result.reply_markup.inline_keyboard[0][2].style, "danger");
+  const fallback = decorateAnimatedEmoji("sendMessage", { text: "🛠 🎞" }, new Map([["🛠", "old-tools"], ["🎞", "old-circle"], ["✨", "sparkles"]]));
+  assert.equal(fallback.text, "✨ ✨");
+});
+
 test("substituting emoji keeps formatting entity positions valid", () => {
   const result = decorateAnimatedEmoji("sendMessage", {
     text: "😀 Тест", entities: [{ type: "bold", offset: 3, length: 4 }],
