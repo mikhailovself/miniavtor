@@ -57,3 +57,40 @@ export function chooseGifka(candidates: GifkaCandidate[], recent: string[], rand
   return eligible.reduce<GifkaCandidate | null>((oldest, item) =>
     !oldest || recent.indexOf(item.key) > recent.indexOf(oldest.key) ? item : oldest, null);
 }
+
+export type GifkaSendResult = { ok: boolean; error_code?: number; description?: string; [key: string]: any };
+
+// Retry only an explicit URL/file rejection. A timeout may mean Telegram already sent it.
+export async function sendGifkaAnimation(url: string, send: (animation: string | Blob) => Promise<GifkaSendResult>, download = downloadGifka): Promise<GifkaSendResult> {
+  const result = await send(url);
+  if (result.ok || result.error_code !== 400 || !/failed to get http url content|wrong (?:file identifier\/)?http url|webpage_curl_failed|webpage_media_empty|failed to fetch|failed to download|wrong type of the web page content|wrong file identifier\/http url specified/i.test(result.description ?? '')) return result;
+  return send(await download(url));
+}
+
+export async function downloadGifka(url: string, fetcher: typeof fetch = fetch): Promise<Blob> {
+  const parsed = new URL(url);
+  // Only the documented public CDN; never follow a redirect to an arbitrary server.
+  if (parsed.protocol !== 'https:' || parsed.hostname !== 'media.gifka.me' || parsed.port || parsed.username || parsed.password) throw new Error('gifka: unsupported download host');
+  const response = await fetcher(url, { redirect: 'error', signal: AbortSignal.timeout(15000) });
+  const maxBytes = 10 * 1024 * 1024;
+  if (!response.ok) throw new Error(`gifka media HTTP ${response.status}`);
+  if (!response.body) throw new Error('gifka: empty media body');
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    if (Number(response.headers.get('content-length')) > maxBytes) throw new Error('gifka: media exceeds 10 MB');
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > maxBytes) throw new Error('gifka: media exceeds 10 MB');
+      chunks.push(value);
+    }
+  } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  if (size < 12 || String.fromCharCode(...bytes.slice(4, 8)) !== 'ftyp') throw new Error('gifka: download is not an MP4');
+  return new Blob([bytes], { type: 'video/mp4' });
+}

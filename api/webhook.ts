@@ -2,7 +2,7 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { waitUntil } from "@vercel/functions";
 import { friendContext, isKnownFriend } from "./friends.js";
 import { ROAST_ENGINE, casualToneHint } from "./roast.js";
-import { gifkaQueries, searchGifka, chooseGifka } from "./gifka.js";
+import { gifkaQueries, searchGifka, chooseGifka, sendGifkaAnimation } from "./gifka.js";
 import { animatedEmojiIds, decorateAnimatedEmoji, stripUnanimatedEmoji, needsAnimatedEmoji } from "./animated-emoji.js";
 import { checkSubscription, subscriptionKeyboard, subscriptionText, type SubscriptionState } from "./subscription.js";
 import {
@@ -207,7 +207,7 @@ const PLAIN_SQUARES: Record<string, string> = { "⬜": "\uE000", "🟩": "\uE001
 const hideSquares = (value: string) => Object.entries(PLAIN_SQUARES).reduce((t, [square, mark]) => t.split(square).join(mark), value);
 const showSquares = (value: string) => Object.entries(PLAIN_SQUARES).reduce((t, [square, mark]) => t.split(mark).join(square), value);
 
-async function tg(method: string, payload: Record<string, unknown>) {
+async function tg(method: string, payload: Record<string, unknown>, upload?: { field: string; name: string; blob: Blob }) {
   const keepSquares = payload.keep_plain_squares === true;
   let source = payload;
   if (keepSquares) {
@@ -223,6 +223,17 @@ async function tg(method: string, payload: Record<string, unknown>) {
     : method === "answerCallbackQuery" && typeof source.text === "string"
       ? { ...source, text: stripUnanimatedEmoji(source.text) } : source;
   const request = async (body: Record<string, unknown>) => {
+    if (upload) {
+      const form = new FormData();
+      for (const [key, value] of Object.entries(body)) {
+        if (value === undefined || value === null || key === upload.field) continue;
+        const encoded = typeof value === "object" ? JSON.stringify(value) : String(value);
+        form.append(key, keepSquares ? showSquares(encoded) : encoded);
+      }
+      form.append(upload.field, upload.blob, upload.name);
+      const response = await fetchT(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`, { method: "POST", body: form }, 25000);
+      return response.json() as Promise<any>;
+    }
     const raw = JSON.stringify(body);
     const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: keepSquares ? showSquares(raw) : raw,
@@ -4371,8 +4382,15 @@ async function handlePrivate(msg: any) {
         if (!chosen) { await send(`По запросу «${query}» нашлась только та гифка, которую я уже прислал. Не буду повторяться — закинь другой пример`); return; }
         const freshCount = candidates.filter(item => !recent.includes(item.key)).length;
         const selection = freshCount ? `Случайная из ${freshCount} без недавних повторов` : "Все уже были — выбрал ту, которую дольше всего не присылал";
-        const sent = await tg("sendAnimation", { chat_id: chatId, animation: chosen.url, caption: `Запрос: ${query}\n${chosen.title}\n${selection}\nГифки: gifka.me` });
-        if (!sent.ok) { await send("Нашёл гифку, но Telegram не смог её отправить. Попробуй другой пример"); return; }
+        const caption = `Запрос: ${query}\n${chosen.title}\n${selection}\nГифки: gifka.me`;
+        const sent = await sendGifkaAnimation(chosen.url, animation => typeof animation === "string"
+          ? tg("sendAnimation", { chat_id: chatId, animation, caption })
+          : tg("sendAnimation", { chat_id: chatId, caption }, { field: "animation", name: "reaction.mp4", blob: animation }));
+        if (!sent.ok) {
+          const details = isOwner(uid) ? `\nTelegram: ${sent.error_code ?? "?"} ${String(sent.description ?? "без описания").slice(0, 350)}` : "";
+          await send(`Нашёл гифку, но отправка не прошла.${details}`);
+          return;
+        }
         // Failed deliveries must not enter the history. Keep at most 30 entries for 7 days of inactivity.
         try {
           const saved = await redisPipe([["LPUSH", historyKey, chosen.key], ["LTRIM", historyKey, 0, 29], ["EXPIRE", historyKey, 7 * 86400]]);

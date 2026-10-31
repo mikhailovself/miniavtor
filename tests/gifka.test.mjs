@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { gifkaCandidates, chooseGifka, gifkaQueries, searchGifka } from '../api/gifka.ts';
+import { gifkaCandidates, chooseGifka, gifkaQueries, searchGifka, sendGifkaAnimation, downloadGifka } from '../api/gifka.ts';
 import { readFileSync } from 'node:fs';
 import { stripTypeScriptTypes } from 'node:module';
 import { runInNewContext } from 'node:vm';
@@ -95,7 +95,7 @@ test('test handler records only successful deliveries and bounds Redis history',
     const { run } = runInNewContext(`${stripTypeScriptTypes(`async function run() { ${source.slice(start, end)} }`)}\n({ run })`, {
       state: { action: 'gifka_test' }, text: 'ну и дела', chatId: 42, uid: '42', checkLimit: async () => ({ ok: true }),
       runLLM: async () => ({ reply: 'удивление' }), CHAT_DECLARATION: {},
-      URLSearchParams, process: { env: {} }, console, gifkaQueries, searchGifka, chooseGifka,
+      URLSearchParams, process: { env: {} }, console, gifkaQueries, searchGifka, chooseGifka, sendGifkaAnimation, isOwner: () => false,
       fetchT: async () => ({ ok: true, json: async () => ({ items: [
         { id: 'a', renditions: [{ format: 'mp4', url: 'https://cdn.example/a.mp4' }] },
       ] }) }),
@@ -108,6 +108,40 @@ test('test handler records only successful deliveries and bounds Redis history',
     if (success) assert.deepEqual(writes, [
       ['LPUSH', 'gifka:test:recent:42', 'id:a'], ['LTRIM', 'gifka:test:recent:42', 0, 29], ['EXPIRE', 'gifka:test:recent:42', 604800],
     ]);
-    else assert.match(messages[0], /Telegram не смог/);
+    else assert.match(messages[0], /отправка не прошла/);
   }
+});
+
+test('explicit Telegram URL rejection downloads and uploads once', async () => {
+  const file = new Blob(['MP4'], { type: 'video/mp4' });
+  const calls = [];
+  const result = await sendGifkaAnimation('https://media.gifka.me/r/test.mp4', async value => {
+    calls.push(value);
+    return typeof value === 'string' ? { ok: false, error_code: 400, description: 'Bad Request: failed to get HTTP URL content' } : { ok: true };
+  }, async () => file);
+  assert.equal(result.ok, true);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1], file);
+});
+
+test('success, rate limits, caption errors and ambiguous failures never trigger an upload retry', async () => {
+  for (const result of [{ ok: true }, { ok: false, error_code: 429 }, { ok: false, error_code: 403 }, { ok: false, error_code: 400, description: 'Bad Request: custom emoji not allowed' }]) {
+    assert.equal(await sendGifkaAnimation('url', async () => result, async () => { throw new Error('must not download'); }), result);
+  }
+  let calls = 0;
+  await assert.rejects(sendGifkaAnimation('url', async () => { calls++; throw new Error('timeout'); }, async () => { throw new Error('must not download'); }), /timeout/);
+  assert.equal(calls, 1);
+});
+
+test('download validates host, size and MP4 signature', async () => {
+  const bytes = new Uint8Array([0, 0, 0, 20, 102, 116, 121, 112, 105, 115, 111, 109]);
+  const blob = await downloadGifka('https://media.gifka.me/r/x.mp4', async (_, options) => {
+    assert.equal(options.redirect, 'error');
+    return new Response(bytes);
+  });
+  assert.equal(blob.size, bytes.length);
+  assert.equal(blob.type, 'video/mp4');
+  await assert.rejects(downloadGifka('https://localhost/x', async () => { throw new Error('must not fetch'); }), /unsupported download host/);
+  await assert.rejects(downloadGifka('https://media.gifka.me/x', async () => new Response('<html>Not an MP4</html>')), /not an MP4/);
+  await assert.rejects(downloadGifka('https://media.gifka.me/x', async () => new Response(bytes, { headers: { 'content-length': String(11 * 1024 * 1024) } })), /exceeds 10 MB/);
 });

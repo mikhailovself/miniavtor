@@ -133,6 +133,25 @@ test("progress bar squares survive both decoration and Telegram errors without a
   assert.equal(calls[0].keep_plain_squares, undefined);
 });
 
+test("multipart animation upload preserves decorated captions and serializes entities", async () => {
+  const webhook = readFileSync(new URL("../api/webhook.ts", import.meta.url), "utf8");
+  const start = webhook.indexOf("const PLAIN_SQUARES");
+  const end = webhook.indexOf("\n// Прогресс-бар битка", start);
+  let received;
+  const { tg } = runInNewContext(`${stripTypeScriptTypes(webhook.slice(start, end))}\n({ tg })`, {
+    decorateAnimatedEmoji, needsAnimatedEmoji, animatedEmojiIds: async () => new Map([["🎧", "123"]]),
+    TELEGRAM_BOT_TOKEN: "test", FormData, console,
+    fetchT: async (_, options) => { received = options; return { json: async () => ({ ok: true }) }; },
+  });
+  const result = await tg("sendAnimation", { chat_id: 42, caption: "🎧 Реакция" }, { field: "animation", name: "reaction.mp4", blob: new Blob(['test'], { type: 'video/mp4' }) });
+  assert.equal(result.ok, true);
+  assert.equal(received.headers, undefined);
+  assert.equal(received.body.get('animation').name, 'reaction.mp4');
+  assert.equal(received.body.get('animation').type, 'video/mp4');
+  assert.equal(received.body.get('chat_id'), '42');
+  assert.equal(JSON.parse(received.body.get('caption_entities'))[0].custom_emoji_id, '123');
+});
+
 test("menu wording and actions stay intact while a verified animated icon is used", () => {
   const ids = new Map([["🎧", "123"], ["📋", "456"]]);
   const original = { text: "<b>📋 Менюшка</b>\n\nНу че, куда?", parse_mode: "HTML", reply_markup: { inline_keyboard: [[
