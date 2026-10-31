@@ -3,9 +3,9 @@ import { waitUntil } from "@vercel/functions";
 import { friendContext, isKnownFriend, friendInfo } from "./friends.js";
 import * as GC from "./group-chat.js";
 import { ROAST_ENGINE, casualToneHint } from "./roast.js";
-import { gifkaQueries, searchGifka, chooseGifka, sendGifkaAnimation } from "./gifka.js";
+import { gifkaQueries, searchGifka, chooseGifka, sendGifkaAnimation, type GifkaCandidate } from "./gifka.js";
 import { animatedEmojiIds, decorateAnimatedEmoji, stripUnanimatedEmoji, needsAnimatedEmoji } from "./animated-emoji.js";
-import { checkSubscription, subscriptionKeyboard, subscriptionText, type SubscriptionState } from "./subscription.js";
+import { CHANNEL_URL, checkSubscription, subscriptionKeyboard, subscriptionText, type SubscriptionState } from "./subscription.js";
 import {
   amendNote, cleanNote, dedupeNotes, esc, findSimilarSaved, formatNote, uniqueItems, MAX_CAPTION, MAX_TEXT,
   type Note, type NoteUpdate, type SavedNote,
@@ -60,7 +60,7 @@ const MEME_SRC = (MEME_CHANNEL ?? "vladavtorx").trim().replace(/^@/, "").toLower
 async function memeSource(): Promise<string> {
   return String((await redis(["GET", "bot:meme_source"])) || MEME_SRC).toLowerCase();
 }
-const WEBHOOK_UPDATES = ["message", "callback_query", "my_chat_member", "channel_post"];
+const WEBHOOK_UPDATES = ["message", "callback_query", "my_chat_member", "channel_post", "inline_query", "chosen_inline_result"];
 const MP3_WORKER_URL = process.env.MP3_WORKER_URL;
 const MP3_WORKER_SECRET = process.env.MP3_WORKER_SECRET;
 function youtubeUrl(input: string): string | null {
@@ -1386,6 +1386,7 @@ ${TEXT_STYLE_RULE}
 - запоминаешь факты («запомни, что…») и забываешь по просьбе;
 - напоминаешь о сроках из заметок;
 - делаешь биты: по ссылке на YouTube (/beat) присылаешь MP3 с BPM и тональностью;
+- определяешь BPM и тональность: в любом чате команда /bpm_avtor просит скинуть бит файлом и считает по нему (или по ссылке на YouTube); /gif_avtor открывает подборку гифок на выбор;
 - делаешь кружки: из присланного видео (/circle) делаешь кружок, берёшь центр кадра, до 60 секунд;
 - узнаёшь человека по анкете («Рассказать о себе»);
 - иногда сам пишешь первым;
@@ -1944,7 +1945,6 @@ async function personalView(uid: string): Promise<View> {
     [btn(`⏰ Напоминания: ${Number(muted) ? "выкл" : "вкл"}`, "personalrem")],
     [btn("🧠 Что я запомнил", "personalmem")],
     [btn("🙋 Рассказать о себе", "prof")],
-    ...(!isOwner(uid) ? [[btn("🧪 Бета-тест", "featuretests")]] : []),
     [btn("🗑 Удалить мои данные", "del")],
     [backBtn()],
   ] } };
@@ -2516,6 +2516,8 @@ async function setupCommands() {
       { command: "tools", description: "Мои инструменты" },
       { command: "beat", description: "Скачать биток из YouTube в MP3" },
       { command: "circle", description: "Сделать кружок из видоса" },
+      { command: "gif_avtor", description: "Найти гифку: /gif_avtor запрос" },
+      { command: "bpm_avtor", description: "Определить BPM и тональность бита" },
       { command: "topics", description: "Мои топики" },
       { command: "connect", description: "Как подключить группу" },
       { command: "author", description: "Автор" },
@@ -2532,6 +2534,9 @@ async function setupCommands() {
       { command: "memories", description: "Что я помню в этом чате" },
       { command: "forgetmemory", description: "Забыть факт (ID из /memories)" },
       { command: "ping", description: "Проверить, что я на связи" },
+      { command: "gif_avtor", description: "Найти гифку: /gif_avtor запрос" },
+      { command: "beat_avtor", description: "Биток из YouTube в MP3" },
+      { command: "bpm_avtor", description: "Определить BPM и тональность бита" },
     ],
     scope: { type: "all_group_chats" },
   });
@@ -2569,9 +2574,9 @@ async function ensureForumCommands(chat: string | number, connected: boolean, fo
 }
 
 async function ensureCommands(force = false) {
-  if (!force && (await redis(["GET", "cmds:v10"]))) return;
+  if (!force && (await redis(["GET", "cmds:v13"]))) return;
   await setupCommands();
-  await redis(["SET", "cmds:v10", "1"]);
+  await redis(["SET", "cmds:v13", "1"]);
 }
 
 // ---------- Кнопки ----------
@@ -3631,7 +3636,7 @@ async function limitNoticeOnce(chat: string, replyTo: number) {
   await tg("sendMessage", { chat_id: chat, text: GC.LIMIT_NOTICE, reply_parameters: { message_id: replyTo, allow_sending_without_reply: true } });
 }
 
-async function sendGifkaTo(chat: string, rawQuery: string, replyTo?: number): Promise<boolean> {
+async function sendGifkaTo(chat: string, rawQuery: string, replyTo?: number, thread?: number): Promise<boolean> {
   const queries = gifkaQueries(rawQuery);
   if (!queries.length) return false;
   const headers: Record<string, string> = {};
@@ -3643,7 +3648,7 @@ async function sendGifkaTo(chat: string, rawQuery: string, replyTo?: number): Pr
   const recent = Array.isArray(history) ? history.filter((x: unknown): x is string => typeof x === "string") : [];
   const chosen = chooseGifka(candidates, recent);
   if (!chosen) return false;
-  const extra = { caption: "Гифки: gifka.me", ...(replyTo ? { reply_parameters: { message_id: replyTo, allow_sending_without_reply: true } } : {}) };
+  const extra = { ...(thread ? { message_thread_id: thread } : {}), ...(replyTo ? { reply_parameters: { message_id: replyTo, allow_sending_without_reply: true } } : {}) };
   const sent = await sendGifkaAnimation(chosen.url, animation => typeof animation === "string"
     ? tg("sendAnimation", { chat_id: chat, animation, ...extra })
     : tg("sendAnimation", { chat_id: chat, ...extra }, { field: "animation", name: "reaction.mp4", blob: animation }));
@@ -3972,6 +3977,225 @@ async function handleChannelPost(post: any) {
   }
 }
 
+// ---------- Музыка в чате: запоминаем присланные треки, по /bpm_avtor даём выбрать и считаем BPM + тональность ----------
+type ChatAudio = { mid: number; fileId: string; name: string; dur: number; size: number; u?: string; k?: "a" | "d" };
+
+function audioFromMessage(msg: any): Omit<ChatAudio, "mid"> | null {
+  if (!msg) return null;
+  const a = msg.audio;
+  if (a?.file_id) return { u: a.file_unique_id, k: "a", fileId: a.file_id, name: ([a.performer, a.title].filter(Boolean).join(" – ") || String(a.file_name ?? "").replace(/\.[a-z0-9]+$/i, "") || "аудио").slice(0, 80), dur: a.duration ?? 0, size: a.file_size ?? 0 };
+  const d = msg.document;
+  if (d?.file_id && (String(d.mime_type ?? "").startsWith("audio/") || /\.(mp3|wav|flac|m4a|aac|ogg|opus)$/i.test(String(d.file_name ?? "")))) {
+    return { u: d.file_unique_id, k: "d", fileId: d.file_id, name: (String(d.file_name ?? "аудио").replace(/\.[a-z0-9]+$/i, "") || "аудио").slice(0, 80), dur: 0, size: d.file_size ?? 0 };
+  }
+  return null;
+}
+
+// Тот же вид, что в подписи MP3 из воркера: по тапу копируется отдельно BPM и отдельно тональность. Нужен parse_mode HTML.
+const copyLine = (bpm?: number | string, key?: string) => `<code>${bpm ? Math.round(Number(bpm)) : "?"} BPM</code> | <code>${esc(key || "не определена")}</code>`;
+// Весь анализ (BPM, тональность) делает воркер: librosa, тот же analyze(), что и для битов с YouTube.
+async function workerAnalyze(body: Record<string, unknown>): Promise<{ ok: boolean; bpm?: string; key?: string }> {
+  if (!MP3_WORKER_URL || !MP3_WORKER_SECRET) return { ok: false };
+  try {
+    const response = await fetch(MP3_WORKER_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${MP3_WORKER_SECRET}` },
+      body: JSON.stringify({ ...body, analyze_only: true }),
+      signal: AbortSignal.timeout(120000),
+    });
+    if (!response.ok) { console.error("mp3 worker analyze HTTP", response.status, (await response.text()).slice(0, 500)); return { ok: false }; }
+    const data: any = await response.json().catch(() => null);
+    if (!data || (data.bpm == null && !data.key)) return { ok: false };
+    return { ok: true, bpm: data.bpm != null ? String(data.bpm) : undefined, key: data.key ? String(data.key) : undefined };
+  } catch (error) { console.error("mp3 worker analyze", error); return { ok: false }; }
+}
+
+async function bpmFromAudio(a: Pick<ChatAudio, "fileId" | "name" | "size">, edit: (text: string) => Promise<unknown>, showName = true) {
+  if (a.size > 20_000_000) { await edit("📦 Файл больше 20 МБ, тг не даёт мне его скачать. Кинь поменьше"); return; }
+  if (!MP3_WORKER_URL || !MP3_WORKER_SECRET) { await edit("⚙️ Конвертация пока не настроена. Напиши админу бота"); return; }
+  const r = await workerAnalyze({ file_id: a.fileId });
+  if (r.ok) { await edit(`${showName ? `🎵 ${esc(a.name)}\n` : ""}${copyLine(r.bpm, r.key)}`); return; }
+  await edit("Не получилось определить, трек битый или слишком тихий. Попробуй другой");
+}
+
+// /bpm_avtor без ссылки: бот просит скинуть бит, следующий трек от этого человека в этом чате считаем.
+async function handleBpmWaiting(msg: any, userId: string): Promise<boolean> {
+  const a = audioFromMessage(msg);
+  if (!a || !REDIS_URL || !userId) return false;
+  const key = `bpmwait:${msg.chat.id}:${userId}`;
+  if (!(await redis(["GET", key]))) return false;
+  await redis(["DEL", key]);
+  const thread: number | undefined = msg.message_thread_id;
+  const extra = { ...(thread ? { message_thread_id: thread } : {}), reply_parameters: { message_id: msg.message_id, allow_sending_without_reply: true } };
+  const status: any = await tg("sendMessage", { chat_id: msg.chat.id, text: "🎚 Считаю, чутка подожди", ...extra });
+  const statusId: number | undefined = status?.ok ? status.result?.message_id : undefined;
+  const edit = (text: string) => statusId ? tg("editMessageText", { chat_id: msg.chat.id, message_id: statusId, text, parse_mode: "HTML" }) : tg("sendMessage", { chat_id: msg.chat.id, text, parse_mode: "HTML", ...extra });
+  waitUntil(bpmFromAudio(a, edit, false));
+  return true;
+}
+
+// ---------- Команды /gif_avtor, /beat_avtor, /bpm_avtor: работают в личке и в любой группе ----------
+const AVTOR_COMMANDS = ["/gif_avtor", "/beat_avtor", "/bpm_avtor"];
+
+// Скачивание MP3 по ссылке: воркер сам присылает файл в чат (в тот же топик).
+async function callMp3Worker(url: string, chat: string | number, thread: number | undefined, analyzeOnly: boolean): Promise<{ ok: boolean; bpm?: string; key?: string }> {
+  if (!MP3_WORKER_URL || !MP3_WORKER_SECRET) return { ok: false };
+  if (analyzeOnly) return workerAnalyze({ url, chat_id: chat });
+  try {
+    const meta = await youtubeMeta(url);
+    const response = await fetch(MP3_WORKER_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${MP3_WORKER_SECRET}` },
+      body: JSON.stringify({ url, chat_id: chat, ...(thread ? { message_thread_id: thread } : {}), title: meta.title, performer: meta.author, file_name: meta.fileName }),
+      signal: AbortSignal.timeout(285000),
+    });
+    if (!response.ok) { console.error("mp3 worker HTTP", response.status, (await response.text()).slice(0, 500)); return { ok: false }; }
+    return { ok: true };
+  } catch (error) { console.error("mp3 worker", error); return { ok: false }; }
+}
+
+// true, если сообщение было нашей командой (дальше его обрабатывать не надо).
+async function handleAvtorCommand(msg: any, cmd: string, arg: string, userId: string): Promise<boolean> {
+  if (!AVTOR_COMMANDS.includes(cmd)) return false;
+  const chat = String(msg.chat.id);
+  const thread: number | undefined = msg.message_thread_id;
+  const replyTo: number | undefined = msg.message_id;
+  const say = (text: string, extra: Record<string, unknown> = {}) => tg("sendMessage", { chat_id: chat, text, ...extra, ...(thread ? { message_thread_id: thread } : {}), ...(replyTo ? { reply_parameters: { message_id: replyTo, allow_sending_without_reply: true } } : {}) });
+  if (!REDIS_URL) return true;
+  // Пауза на человека в чате: гифка 10 с, тяжёлые команды 60 с.
+  const cooldown = cmd === "/gif_avtor" ? 10 : 60;
+  const free = await redis(["SET", `avt:${cmd}:${chat}:${userId}`, "1", "NX", "EX", cooldown]);
+  if (!free) { await say(`Погоди чуть-чуть, команду можно раз в ${cooldown} сек`); return true; }
+
+  const replied = msg.reply_to_message;
+  const fallback = String(replied?.text ?? replied?.caption ?? "").trim();
+
+  if (cmd === "/gif_avtor") {
+    // Как @pic: кнопка подставляет «@бот запрос» в поле ввода этого же чата и открывает сетку гифок на выбор.
+    const query = (arg || fallback).slice(0, 100);
+    await tg("sendMessage", {
+      chat_id: chat,
+      text: query ? `🖼 Гифки по запросу «${query}»` : "🖼 Жми кнопку и пиши, что искать",
+      ...(thread ? { message_thread_id: thread } : {}),
+      ...(replyTo ? { reply_parameters: { message_id: replyTo, allow_sending_without_reply: true } } : {}),
+      reply_markup: { inline_keyboard: [[{ text: "🖼 Выбрать гифку", switch_inline_query_current_chat: query }]] },
+    });
+    return true;
+  }
+
+  if (cmd === "/bpm_avtor" && !youtubeUrl(arg) && !youtubeUrl(fallback)) {
+    // Трек: файл с подписью-командой или ответ командой на аудио. Иначе просим скинуть бит.
+    const direct = audioFromMessage(msg) ?? audioFromMessage(replied);
+    if (direct) {
+      const status: any = await say("🎚 Считаю, чутка подожди");
+      const statusId: number | undefined = status?.ok ? status.result?.message_id : undefined;
+      const edit = (text: string) => statusId ? tg("editMessageText", { chat_id: chat, message_id: statusId, text, parse_mode: "HTML" }) : say(text, { parse_mode: "HTML" });
+      waitUntil(bpmFromAudio(direct, edit));
+      return true;
+    }
+    await redis(["SET", `bpmwait:${chat}:${userId}`, "1", "EX", 600]);
+    await say("🎚 Теперь скинь бит файлом, определю BPM и тональность", { reply_markup: { force_reply: true, selective: true, input_field_placeholder: "Скинь бит" } });
+    return true;
+  }
+
+  const url = youtubeUrl(arg) ?? youtubeUrl(fallback);
+  if (!url) { await say(`Пришли ссылку на одно видео YouTube: ${cmd} https://youtu.be/... (или ответь командой на сообщение со ссылкой)`); return true; }
+  if (!MP3_WORKER_URL || !MP3_WORKER_SECRET) { await say("⚙️ Конвертация пока не настроена. Напиши админу бота"); return true; }
+  const analyzeOnly = cmd === "/bpm_avtor";
+  const status: any = await say(analyzeOnly ? "🎚 Считаю BPM и тональность, чутка подожди" : "🎶 Делаю биток, чутка подожди");
+  const statusId: number | undefined = status?.ok ? status.result?.message_id : undefined;
+  waitUntil((async () => {
+    const result = await callMp3Worker(url, chat, thread, analyzeOnly);
+    const finish = async (text?: string) => {
+      if (!statusId) { if (text) await say(text); return; }
+      if (text) await tg("editMessageText", { chat_id: chat, message_id: statusId, text, parse_mode: "HTML" });
+      else await tg("deleteMessage", { chat_id: chat, message_id: statusId }).catch(() => {});
+    };
+    if (!result.ok) { await finish(analyzeOnly ? "Не получилось определить BPM. Попробуй другую ссылку" : "Не получилось сделать MP3 из этого видео. Попробуй позже или пришли другую ссылку"); return; }
+    if (!analyzeOnly) { await finish(); return; }
+    await finish(copyLine(result.bpm, result.key));
+  })());
+  return true;
+}
+
+// ---------- Инлайн-режим: @бот запрос в любом чате ----------
+// В BotFather: /setinline (включить, плейсхолдер), /setinlinefeedback = Enabled (нужен для BPM). Затем в админке «Включить нужные обновления».
+const shortId = (s: string): string => { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0; return h.toString(36); };
+const inlineArticle = (id: string, title: string, description: string, text: string, kb?: any) => ({
+  type: "article", id, title, description,
+  input_message_content: { message_text: text, parse_mode: "HTML", link_preview_options: { is_disabled: true } },
+  ...(kb ? { reply_markup: kb } : {}),
+});
+
+async function handleInlineQuery(iq: any) {
+  const uid = Number(iq.from?.id);
+  const answer = (results: any[], cache = 5, personal = true) => tg("answerInlineQuery", { inline_query_id: iq.id, results: results.slice(0, 50), cache_time: cache, is_personal: personal });
+  if (!uid || iq.from?.is_bot) return;
+
+  // Та же подписка на канал, что и в личке; успешную проверку помним 2 минуты.
+  const subKey = `inl:sub:${uid}`;
+  if (!(await redis(["GET", subKey]))) {
+    const state = await checkSubscription(TELEGRAM_BOT_TOKEN, uid);
+    if (state !== "subscribed") {
+      await answer([inlineArticle("sub", "Сначала подпишись на канал", "Без подписки не работаю", esc(subscriptionText(state)), subscriptionKeyboard())]);
+      return;
+    }
+    await redis(["SET", subKey, "1", "EX", 120]);
+  }
+
+  const q = String(iq.query ?? "").trim().slice(0, 200);
+  if (!q) {
+    await answer([
+      inlineArticle("h1", "🖼 Гифки", "Напиши запрос, например: смех", "Пиши <code>@бот запрос</code> и выбирай гифку"),
+      inlineArticle("h2", "🎚 BPM и тональность", "Вставь ссылку на видео YouTube", "Вставь ссылку YouTube после <code>@бот</code>, и я определю BPM и тональность"),
+    ], 30, false);
+    return;
+  }
+
+  const url = youtubeUrl(q);
+  if (url) {
+    if (!MP3_WORKER_URL || !MP3_WORKER_SECRET) { await answer([inlineArticle("nw", "Конвертация не настроена", "Напиши админу бота", "⚙️ Конвертация пока не настроена")]); return; }
+    const token = shortId(`${uid}:${url}:${Date.now()}`);
+    await redis(["SET", `inl:bpm:${token}`, url, "EX", 900]);
+    // Кнопка нужна, чтобы Telegram прислал inline_message_id и мы смогли отредактировать сообщение.
+    await answer([inlineArticle(`bpm:${token}`, "🎚 Определить BPM и тональность", "Отправлю в чат и допишу результат через минуту", "🎚 Считаю BPM и тональность, чутка подожди", { inline_keyboard: [[{ text: "📣 Канал автора", url: CHANNEL_URL }]] })], 0);
+    return;
+  }
+
+  if (q.length < 2) return;
+  const cacheKey = `inl:gif:${q.toLowerCase()}`;
+  let candidates: GifkaCandidate[] = [];
+  try { const cached = await redis(["GET", cacheKey]); if (cached) candidates = JSON.parse(String(cached)); } catch {}
+  if (!candidates.length) {
+    try {
+      const headers: Record<string, string> = {};
+      if (process.env.GIFKA_API_KEY?.trim()) headers["X-Api-Key"] = process.env.GIFKA_API_KEY.trim();
+      // Инлайн-запрос живёт несколько секунд, поэтому таймаут короткий и запросов не больше двух.
+      const fetcher = (u: string, init: { headers: Record<string, string> }) => fetchT(u, init, 3500);
+      const queries = gifkaQueries(q).slice(0, 2);
+      // Как в @pic: сетка побольше. Если API не принимает такой limit, откатываемся на 10.
+      const found = await searchGifka(queries, headers, fetcher, 30).catch(() => searchGifka(queries, headers, fetcher));
+      candidates = found.candidates;
+      if (candidates.length) await redis(["SET", cacheKey, JSON.stringify(candidates), "EX", 600]);
+    } catch (error) { console.error("inline gifka", error); }
+  }
+  if (!candidates.length) { await answer([inlineArticle("none", "Гифок не нашёл", "Попробуй другое слово", "гифку не нашёл, бро")], 30); return; }
+  await answer(candidates.map(c => ({ type: "mpeg4_gif", id: shortId(c.key), mpeg4_url: c.url, thumbnail_url: c.url, thumbnail_mime_type: "video/mp4", title: c.title })), 300, false);
+}
+
+// Человек выбрал «BPM»: считаем и дописываем результат в отправленное сообщение.
+async function handleChosenInlineResult(cr: any) {
+  const id = String(cr.result_id ?? "");
+  if (!id.startsWith("bpm:") || !cr.inline_message_id) return;
+  const token = id.slice(4);
+  const url = await redis(["GET", `inl:bpm:${token}`]);
+  const edit = (text: string) => tg("editMessageText", { inline_message_id: cr.inline_message_id, text, parse_mode: "HTML" });
+  if (!url) { await edit("Ссылка устарела, попробуй ещё раз"); return; }
+  const result = await callMp3Worker(String(url), cr.from?.id, undefined, true);
+  if (!result.ok) { await edit("Не получилось определить BPM. Попробуй другую ссылку"); return; }
+  await edit(copyLine(result.bpm, result.key));
+}
+
 async function handleGroup(msg: any) {
   if (!REDIS_URL) return;
   const chat = String(msg.chat.id);
@@ -4000,6 +4224,9 @@ async function handleGroup(msg: any) {
 
   // Команда адресована другому боту: не трогаем
   if (rawCmd.startsWith("/") && cmdBot && (await botName()).toLowerCase() !== cmdBot.toLowerCase()) return;
+
+  if (fromId && !msg.from?.is_bot && await handleBpmWaiting(msg, fromId)) return;
+  if (fromId && !msg.from?.is_bot && await handleAvtorCommand(msg, cmd, arg, fromId)) return;
 
   const threadId: number | undefined = msg.message_thread_id;
   const say = (t: string) => sayIn(chat, threadId, t);
@@ -4280,6 +4507,8 @@ async function handlePrivate(msg: any) {
   const cmd = (parts[0] ?? "").split("@")[0].toLowerCase();
   const arg = text.trim().slice((parts[0] ?? "").length).trim();
   const hasLiveMedia = Boolean(msg.photo?.length || msg.animation || msg.video || msg.voice || msg.video_note || msg.document || msg.sticker);
+  if (await handleBpmWaiting(msg, uid)) return;
+  if (await handleAvtorCommand(msg, cmd, arg, uid)) return;
   const ordinary = (!cmd.startsWith("/") || hasLiveMedia) && !MENU_BUTTON_TEXTS.includes(text.trim()) && !quickAction(text);
   const ownerStateRaw = isOwner(uid) && ordinary ? await redis(["GET", `st:${uid}`]) : null;
   let ownerState: any = null;
@@ -4518,7 +4747,7 @@ async function handlePrivate(msg: any) {
       await send("Не вижу адрес вебхука. Сначала установи его через setWebhook.");
     } else {
       const result = await tg("setWebhook", { url, secret_token: WEBHOOK_SECRET, allowed_updates: WEBHOOK_UPDATES });
-      await send(result.ok ? "Готово: message, callback_query, my_chat_member, channel_post включены." : `Не вышло: ${result.description ?? "Telegram"}`);
+      await send(result.ok ? "Готово: message, callback_query, my_chat_member, channel_post, inline_query, chosen_inline_result включены." : `Не вышло: ${result.description ?? "Telegram"}`);
     }
     return;
   }
@@ -4612,7 +4841,7 @@ async function handlePrivate(msg: any) {
         if (!chosen) { await send(`По запросу «${query}» нашлась только та гифка, которую я уже прислал. Не буду повторяться — закинь другой пример`); return; }
         const freshCount = candidates.filter(item => !recent.includes(item.key)).length;
         const selection = freshCount ? `Случайная из ${freshCount} без недавних повторов` : "Все уже были — выбрал ту, которую дольше всего не присылал";
-        const caption = `Запрос: ${query}\n${chosen.title}\n${selection}\nГифки: gifka.me`;
+        const caption = `Запрос: ${query}\n${chosen.title}\n${selection}`;
         const sent = await sendGifkaAnimation(chosen.url, animation => typeof animation === "string"
           ? tg("sendAnimation", { chat_id: chatId, animation, caption })
           : tg("sendAnimation", { chat_id: chatId, caption }, { field: "animation", name: "reaction.mp4", blob: animation }));
@@ -4985,7 +5214,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (await redis(["SET", lockKey, "1", "NX", "EX", 330]) !== "OK") return res.status(503).send("update is processing");
     // Another worker may have completed between GET and lock acquisition.
     if (await redis(["GET", doneKey])) return res.status(200).send("ok");
-    if (upd?.callback_query) {
+    if (upd?.inline_query) {
+      await handleInlineQuery(upd.inline_query);
+    } else if (upd?.chosen_inline_result) {
+      await handleChosenInlineResult(upd.chosen_inline_result);
+    } else if (upd?.callback_query) {
       await handleCallback(upd.callback_query);
     } else if (upd?.my_chat_member) {
       await handleMyChatMember(upd.my_chat_member);

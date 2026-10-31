@@ -190,7 +190,7 @@
 +  const recent = Array.isArray(history) ? history.filter((x: unknown): x is string => typeof x === "string") : [];
 +  const chosen = chooseGifka(candidates, recent);
 +  if (!chosen) return false;
-+  const extra = { caption: "Гифки: gifka.me", ...(replyTo ? { reply_parameters: { message_id: replyTo, allow_sending_without_reply: true } } : {}) };
++  const extra = { ...(replyTo ? { reply_parameters: { message_id: replyTo, allow_sending_without_reply: true } } : {}) };
 +  const sent = await sendGifkaAnimation(chosen.url, animation => typeof animation === "string"
 +    ? tg("sendAnimation", { chat_id: chat, animation, ...extra })
 +    : tg("sendAnimation", { chat_id: chat, ...extra }, { field: "animation", name: "reaction.mp4", blob: animation }));
