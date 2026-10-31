@@ -1,13 +1,57 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { gifkaCandidates, chooseGifka } from '../api/gifka.ts';
+import { gifkaCandidates, chooseGifka, gifkaQueries, searchGifka } from '../api/gifka.ts';
 import { readFileSync } from 'node:fs';
 import { stripTypeScriptTypes } from 'node:module';
 import { runInNewContext } from 'node:vm';
 test('gifka response accepts only HTTPS MP4 renditions', () => {
   const result = gifkaCandidates({items:[{title:'кот',renditions:[{format:'mp4',url:'https://cdn.example/cat.mp4'}]},{renditions:[{format:'mp4',url:'http://bad.example/x.mp4'}]},{renditions:[{format:'webp',url:'https://cdn.example/a.webp'}]}]});
   assert.equal(result.length,1); assert.equal(result[0].title,'кот');
-  assert.deepEqual(gifkaCandidates({}),[]);
+  assert.throws(() => gifkaCandidates({}), /unexpected response/);
+});
+
+// Reduced from the live /v1/search?q=привет response checked on 2026-10-31.
+const actualResponse = { items: [{ id: '8m7q1ttazo13', type: 'gif', title: 'Нежный привет от пушистого кота', renditions: [
+  { kind: 'mp4', width: 480, height: 480, bytes: 125159, mime: 'video/mp4', url: 'https://media.gifka.me/r/8m7q1ttazo13/v1/480.mp4' },
+  { kind: 'webp', width: 200, height: 200, mime: 'image/webp', url: 'https://media.gifka.me/r/8m7q1ttazo13/v1/200.webp' },
+] }] };
+
+test('real API kind and mime fields produce a sendable animation', () => {
+  const items = gifkaCandidates(actualResponse);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].url, 'https://media.gifka.me/r/8m7q1ttazo13/v1/480.mp4');
+  assert.equal(items[0].key, 'id:8m7q1ttazo13');
+  assert.equal(gifkaCandidates({ items: [{ renditions: [
+    { kind: 'mp4', url: 'http://bad.example/a.mp4' },
+    { mime: 'video/mp4', url: 'https://cdn.example/good.mp4' },
+  ] }] })[0].url, 'https://cdn.example/good.mp4');
+});
+
+test('search removes format words and tries up to three shorter queries only on empty results', async () => {
+  assert.deepEqual(gifkaQueries('«привет махал рукой гиф»'), ['привет махал рукой', 'привет махал', 'привет']);
+  assert.deepEqual(gifkaQueries(' GIF '), []);
+  const requests = [];
+  const found = await searchGifka(gifkaQueries('привет махал рукой гиф'), {}, async url => {
+    const params = new URL(url).searchParams;
+    assert.equal(params.get('type'), 'gif');
+    assert.equal(params.get('limit'), '10');
+    requests.push(params.get('q'));
+    return { ok: true, status: 200, json: async () => requests.length < 3 ? { items: [] } : actualResponse };
+  });
+  assert.deepEqual(requests, ['привет махал рукой', 'привет махал', 'привет']);
+  assert.equal(found.query, 'привет');
+  assert.equal(found.candidates.length, 1);
+});
+
+test('schema changes and HTTP failures are not misreported as an empty catalog', async () => {
+  for (const data of [{ error: 'bad' }, { items: [{ renditions: [{ kind: 'webp', url: 'https://cdn.example/x.webp' }] }] }]) {
+    let requests = 0;
+    await assert.rejects(searchGifka(['привет', 'пока'], {}, async () => {
+      requests++; return { ok: true, status: 200, json: async () => data };
+    }), /gifka:/);
+    assert.equal(requests, 1);
+  }
+  await assert.rejects(searchGifka(['привет'], {}, async () => ({ ok: false, status: 429 })), /HTTP 429/);
 });
 
 const candidates = ['a', 'b', 'c'].map(key => ({ key, title: key, url: `https://cdn.example/${key}.mp4` }));
@@ -51,7 +95,7 @@ test('test handler records only successful deliveries and bounds Redis history',
     const { run } = runInNewContext(`${stripTypeScriptTypes(`async function run() { ${source.slice(start, end)} }`)}\n({ run })`, {
       state: { action: 'gifka_test' }, text: 'ну и дела', chatId: 42, uid: '42', checkLimit: async () => ({ ok: true }),
       runLLM: async () => ({ reply: 'удивление' }), CHAT_DECLARATION: {},
-      URLSearchParams, process: { env: {} }, console, gifkaCandidates, chooseGifka,
+      URLSearchParams, process: { env: {} }, console, gifkaQueries, searchGifka, chooseGifka,
       fetchT: async () => ({ ok: true, json: async () => ({ items: [
         { id: 'a', renditions: [{ format: 'mp4', url: 'https://cdn.example/a.mp4' }] },
       ] }) }),
