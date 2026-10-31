@@ -12,7 +12,7 @@ const sendUntil = source.indexOf("\n// Настройки группы", sendFro
 assert.ok(from >= 0 && until > from && sendFrom > until && sendUntil > sendFrom);
 const code = stripTypeScriptTypes(`${source.slice(from, until)}\n${source.slice(sendFrom, sendUntil)}`);
 
-test("imports regular stickers from a set and sends one as a meme", async () => {
+test("imports static and animated stickers from a set and sends one as a meme", async () => {
   const stored = new Set();
   const calls = [];
   const f = runInNewContext(`${code}\n({ memeFromMessage, stickerSetName, importStickerSet, sendMeme })`, {
@@ -34,13 +34,14 @@ test("imports regular stickers from a set and sends one as a meme", async () => 
   });
   assert.equal(f.stickerSetName("https://t.me/addstickers/friends_pack"), "friends_pack");
   assert.equal(f.memeFromMessage({ sticker: { type: "regular", file_id: "one" } }), "s:one");
+  assert.equal(f.memeFromMessage({ sticker: { type: "regular", file_id: "one", is_video: true } }), "s:one");
   const result = await f.importStickerSet("friends_pack");
   assert.equal(result.added, 2);
   assert.equal(result.total, 2);
   assert.deepEqual([...stored], ["s:abc", "s:def"]);
-  assert.equal(await f.sendMeme("123", "s:abc", 42, "ну ты"), true);
+  assert.equal(await f.sendMeme("123", "s:def", 42, "ну ты"), true);
   const sticker = calls.find((x) => x.method === "sendSticker");
-  assert.equal(sticker.payload.sticker, "abc");
+  assert.equal(sticker.payload.sticker, "def");
   assert.equal(sticker.payload.reply_parameters.message_id, 42);
   assert.equal(calls.some((x) => x.method === "sendMessage"), false);
 });

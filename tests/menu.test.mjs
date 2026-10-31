@@ -22,9 +22,9 @@ test("start menu leads to abilities, ordinary group and secretary", async () => 
   });
   const menu = await views.mainView({ id: "123" });
   const callbacks = menu.kb.inline_keyboard.flat().map((button) => button.callback_data);
-  assert.deepEqual(Array.from(callbacks), ["abilities", "groupadd", "secretary", "tools", "author", "personal"]);
-  assert.equal(menu.kb.inline_keyboard[2][0].text, "👍 автор бота");
-  assert.deepEqual(Array.from(menu.kb.inline_keyboard.slice(0, 3), row => row.length), [2, 2, 2]);
+  assert.deepEqual(Array.from(callbacks), ["abilities", "groupadd", "tools", "author", "personal"]);
+  assert.equal(menu.kb.inline_keyboard[3][0].text, "👍 автор бота");
+  assert.deepEqual(Array.from(menu.kb.inline_keyboard.slice(0, 4), row => row.length), [1, 1, 1, 2]);
   assert.equal(menu.text, "<b>📋 Менюшка</b>\n\nНу че, куда?");
   assert.match(views.abilitiesView().text, /тематическим папкам/);
   assert.doesNotMatch(views.abilitiesView().text, /Смотрю и слушаю/);
@@ -62,12 +62,11 @@ test("opening a new menu removes the previous bot menu after sending", async () 
   assert.equal(JSON.parse(saved.get("ui:menu:42")).id, 101);
 });
 
-test("unsupported custom emoji icon falls back to a text-only button", async () => {
+test("unsupported custom emoji does not resend a menu without its icons", async () => {
   const first = source.indexOf("async function tgView(");
   const last = source.indexOf("\nasync function sendView(", first);
   const calls = [];
   const { tgView } = runInNewContext(`${stripTypeScriptTypes(source.slice(first, last))}\n({ tgView })`, {
-    plainEmojiFallback: (_, payload) => payload,
     tg: async (method, payload) => {
       calls.push({ method, payload });
       return calls.length === 1 ? { ok: false, error_code: 400 } : { ok: true };
@@ -76,7 +75,7 @@ test("unsupported custom emoji icon falls back to a text-only button", async () 
   const result = await tgView("sendMessage", { reply_markup: { inline_keyboard: [[
     { text: "автор бота", callback_data: "author", icon_custom_emoji_id: "222" },
   ]] } });
-  assert.equal(result.ok, true);
-  assert.equal(calls[1].payload.reply_markup.inline_keyboard[0][0].text, "автор бота");
-  assert.equal(calls[1].payload.reply_markup.inline_keyboard[0][0].icon_custom_emoji_id, undefined);
+  assert.equal(result.ok, false);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].payload.reply_markup.inline_keyboard[0][0].icon_custom_emoji_id, "222");
 });

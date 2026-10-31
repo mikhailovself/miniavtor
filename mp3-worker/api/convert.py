@@ -204,8 +204,9 @@ def progress_emoji_ids():
             if (sticker.get("type") == "custom_emoji" and emoji and sticker.get("custom_emoji_id")
                     and (sticker.get("is_animated") or sticker.get("is_video"))
                     and not sticker.get("needs_repainting")):
-                ids.setdefault(emoji, sticker["custom_emoji_id"])
-    _progress_emoji_ids = ids
+                ids.setdefault(emoji.replace("\ufe0f", ""), sticker["custom_emoji_id"])
+    if ids:
+        _progress_emoji_ids = ids
     return ids
 
 
@@ -216,19 +217,18 @@ def update_progress(chat_id, message_id, text):
         ids = progress_emoji_ids()
         emoji = ("🎶", "⬇️", "🎛", "📤")
         pattern = re.compile("|".join(map(re.escape, emoji)))
-        tidy = lambda value: re.sub(r"(?m)^ +", "", value)
-        # Без HTML-тегов и без эмодзи: запасной вариант, если анимированные недоступны.
-        plain = tidy(re.sub(r"</?b>", "", pattern.sub("", text)))
-        animated = tidy(pattern.sub(lambda match: (
-            f'<tg-emoji emoji-id="{ids[match.group()]}">{match.group()}</tg-emoji>'
-            if match.group() in ids else ""
-        ), text))
+        def animated_icon(match):
+            original = match.group().replace("\ufe0f", "")
+            alternatives = {"🎶": ("🎵", "🎧"), "⬇": ("📥", "👇"),
+                            "🎛": ("⚙", "🛠"), "📤": ("📨", "✉")}
+            for candidate in (original, *alternatives.get(original, ()), "✨", "⭐", *ids):
+                if candidate in ids:
+                    return f'<tg-emoji emoji-id="{ids[candidate]}">{candidate}</tg-emoji>'
+            raise RuntimeError("No verified animated progress icons")
+        animated = pattern.sub(animated_icon, text)
         fields = {"chat_id": str(chat_id), "message_id": message_id}
-        try:
-            telegram("editMessageText", {**fields, "text": animated, "parse_mode": "HTML"})
-        except Exception:
-            logging.warning("Animated progress emoji unavailable; using text-only progress")
-            telegram("editMessageText", {**fields, "text": plain})
+        # При отказе Telegram сохраняем предыдущий прогресс, не убираем значки.
+        telegram("editMessageText", {**fields, "text": animated, "parse_mode": "HTML"})
     except Exception:
         logging.exception("Could not update beat progress")
 
