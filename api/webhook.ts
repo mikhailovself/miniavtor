@@ -3361,6 +3361,30 @@ async function pickGroupPhoto(chat: string, current?: string): Promise<string | 
   return choice ? String(choice) : null;
 }
 
+// Гифка как ещё один источник в той же системе мемов: подбирается по теме текущего сообщения через gifka.
+// В формате совпадает со стоковыми записями ("a:" = анимация), поэтому дальше идёт по тому же пути (sendMeme, подпись от модели).
+async function pickGifkaMeme(text: string, chat: string): Promise<string | null> {
+  if (text.trim().length < 2) return null;
+  try {
+    const queries = gifkaQueries(text).slice(0, 2);
+    if (!queries.length) return null;
+    const headers: Record<string, string> = {};
+    if (process.env.GIFKA_API_KEY?.trim()) headers["X-Api-Key"] = process.env.GIFKA_API_KEY.trim();
+    const { candidates } = await searchGifka(queries, headers, (u, init) => fetchT(u, init, 3500));
+    if (!candidates.length) return null;
+    const historyKey = `gifka:ambient:${chat}`;
+    const history = await redis(["LRANGE", historyKey, 0, 29]);
+    const recent = Array.isArray(history) ? history.filter((k: unknown): k is string => typeof k === "string") : [];
+    const chosen = chooseGifka(candidates, recent);
+    if (!chosen) return null;
+    await redisPipe([["LPUSH", historyKey, chosen.key], ["LTRIM", historyKey, 0, 29], ["EXPIRE", historyKey, 7 * 86400]]);
+    return `a:${chosen.url}`;
+  } catch (error) {
+    console.error("pickGifkaMeme", error);
+    return null;
+  }
+}
+
 async function sendMeme(chat: string, pick: string, replyTo?: number, caption?: string): Promise<boolean> {
   const kind = pick[0];
   const [method, field] = kind === "a" ? ["sendAnimation", "animation"] : kind === "v" ? ["sendVideo", "video"] : kind === "s" ? ["sendSticker", "sticker"] : ["sendPhoto", "photo"];
@@ -3837,15 +3861,21 @@ async function groupChatter(msg: any) {
   let meme: string | null = null;
   let fromGroup = false;
   if (!addressed && Math.random() < await setting("meme")) {
-    if (groupPhotos && Math.random() < 0.6) {
+    const roll = Math.random();
+    if (groupPhotos && roll < 0.45) {
       meme = await pickGroupPhoto(chat, ownPhoto);
       fromGroup = Boolean(meme);
+    } else if (roll < 0.75) {
+      meme = await pickMeme(chat);
     }
+    // Если выбранный источник пуст, пробуем остальные по очереди. Гифка — последней: она почти
+    // всегда что-то найдёт, поэтому служит подстраховкой, когда свой запас мемов и фото пуст.
     if (!meme) meme = await pickMeme(chat);
     if (!meme && groupPhotos) {
       meme = await pickGroupPhoto(chat, ownPhoto);
       fromGroup = Boolean(meme);
     }
+    if (!meme) meme = await pickGifkaMeme(text, chat);
   }
   if (!addressed && !meme && Math.random() < await setting("forward")) {
     const posts = await redis(["SRANDMEMBER", "channel:posts"]);
