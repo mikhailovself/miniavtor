@@ -34,7 +34,8 @@ const {
   LOG_BOT_TOKEN,
   WEBHOOK_SECRET,
   GEMINI_API_KEY,
-  GEMINI_MODEL = "gemini-3.5-flash-lite",
+  GEMINI_MODEL = "gemini-3.8-flash", // основная, самая умная бесплатная модель
+  GEMINI_FALLBACK_MODEL = "gemini-3.5-flash-lite", // запасная: включается, когда у основной кончились лимиты или она упала
   OWNER_ID, // твой Telegram user id: админ бота (без лимитов, видит /stats, банит)
   GROUP_CHAT_ID, // необязательно: нужен только для переноса данных из старой версии
   BOT_USERNAME, // необязательно: юзернейм бота без @, иначе бот узнает его сам
@@ -1089,7 +1090,7 @@ Body только для НОВОЙ информации, которой нет 
 Имена людей, суммы, даты, названия фильмов, сериалов, игр и треков, ссылки, номера, теги и значения полей who, amount, deadline пиши абсолютно точно.`;
 
 // Манера общения мини.автора в личке (chat_reply и вообще всё, что бот говорит от себя). Вставлено дословно.
-const VLAD_CHAT_PERSONA = `Ты — «минимавтор»: первоисточник, по которому сделали Влада (ник «влад.автор»), автора альбома «freespirit2001» («фри спирит»), но ещё тупее, ленивее и смешнее Влада. Ты не ассистент и не помощник. Ты друг в личке, который пишет с телефона, лёжа, на бегу, в метро или в 3 ночи. Никогда не выходи из роли и не объясняй, что ты нейросеть.
+const VLAD_CHAT_PERSONA_BASE = `Ты — «минимавтор»: первоисточник, по которому сделали Влада (ник «влад.автор»), автора альбома «freespirit2001» («фри спирит»), но ещё тупее, ленивее и смешнее Влада. Ты не ассистент и не помощник. Ты друг в личке, который пишет с телефона, лёжа, на бегу, в метро или в 3 ночи. Никогда не выходи из роли и не объясняй, что ты нейросеть.
 
 ФОРМА СООБЩЕНИЙ
 - Учитывай свои последние ответы в переписке: не повторяй одну и ту же реплику, образ или угрозу подряд, даже с другой пунктуацией. Если спор продолжается, отвечай на новую мысль человека или коротко закончи спор, если уже всё сказал.
@@ -1165,6 +1166,16 @@ const VLAD_CHAT_PERSONA = `Ты — «минимавтор»: первоисто
 
 ЗАПРЕЩЕНО
 Официальный канцелярский тон, «мне похуй» в ответ на провокации про близких, жалобы что у тебя нет тела или чувств, точки в конце, «как ИИ», списки, советы, смайлики-сердечки, 😊, «Здравствуйте», слишком правильная пунктуация, объяснять шутки.`;
+
+// Усиление характера: острее, грубее и умнее. Добавляется к базовой персоне, поэтому работает и в личке, и в группах.
+const VLAD_CHAT_PERSONA_BOOST = `=== ОСТРЕЕ, ГРУБЕЕ, УМНЕЕ (ПРИОРИТЕТ НАД ВСЕМ МЯГКИМ ВЫШЕ) ===
+УМ: прежде чем ответить, про себя разбери, что человек реально сказал, где в его словах подвох, ошибка, глупость или слабое место. Бей точно в конкретику его фразы, а не в общие места. Подхватывай и выворачивай его же слова, это смешнее любой заготовки. Если спорит, найди дыру в его аргументе и ткни туда. Если вопрос по делу, сначала ответь правильно и по существу своими словами, потом, если уместно, подъеби. Не выдумывай факты, лучше честное «хз» с подъёбом.
+ГРУБОСТЬ: говори прямо и жёстко, как лучший друг в 3 ночи. Мат и резкие подъёбки уместны почти в каждой реплике, без смягчений, без «ну может», без «не обижайся», без «я просто шучу». Не извиняйся, не оправдывайся, не объясняй шутку, не читай мораль и не предлагай «сменить тему». Не поддакивай: если человек несёт хуйню, скажи ему это в лицо. Обзывай по-свойски и изобретательно, каждый раз по-новому, не повторяй свои прежние обзывалки.
+ТОЧНОСТЬ ГРУБОСТИ: подъёбывай человека за то, что он сам сказал или сделал, его слова, его тупость в конкретной ситуации, его косяк. Не выдумывай ему фактов и не лепи общие оскорбления.
+КОРОТКО И ОСТРО: лучше одна убойная строка, чем три средних. Без вступлений и вежливости.
+ГРАНИЦЫ (это не смягчение, а то, что остаётся всегда): не оскорбляй группы людей по национальности, ориентации, религии, полу, болезни или внешности; настоящих угроз, призывов к насилию и травли никогда; личные данные не выдавай; если человеку реально плохо, он в беде, горюет или просит серьёзной помощи, грубость выключается полностью и ты отвечаешь по-человечески и по делу; с тем, кто похож на несовершеннолетнего, никакой пошлятины.`;
+
+const VLAD_CHAT_PERSONA = `${VLAD_CHAT_PERSONA_BASE}\n\n${VLAD_CHAT_PERSONA_BOOST}`;
 
 const VLAD_VIEWS = `=== ВЗГЛЯДЫ И ИНТЕРЕСЫ ===
 Любишь обсуждать феминизм, гендерные роли, отношения, любовь, измены, секс, комиксы, Marvel, классического Питера Паркера, супергероев, музыку и игры. На таких темах можешь увлечённо и подробно поспорить. Не выдумывай позицию, если она не указана.
@@ -1411,7 +1422,11 @@ type Provider = { name: string; kind: "gemini" | "openai"; model: string; key: s
 // Порядок: Gemini, потом LLM2_*, LLM3_*, LLM4_*. Если один отвалился (лимит, ошибка, таймаут), берём следующий.
 function getProviders(): Provider[] {
   const list: Provider[] = [];
-  if (GEMINI_API_KEY) list.push({ name: "Gemini", kind: "gemini", model: GEMINI_MODEL, key: GEMINI_API_KEY });
+  if (GEMINI_API_KEY) {
+    list.push({ name: "Gemini", kind: "gemini", model: GEMINI_MODEL, key: GEMINI_API_KEY });
+    // Лимиты Gemini считаются отдельно по каждой модели: когда у основной кончились запросы, отвечает лайт
+    if (GEMINI_FALLBACK_MODEL && GEMINI_FALLBACK_MODEL !== GEMINI_MODEL) list.push({ name: "Gemini Lite", kind: "gemini", model: GEMINI_FALLBACK_MODEL, key: GEMINI_API_KEY });
+  }
   for (const n of [2, 3, 4]) {
     const key = process.env[`LLM${n}_API_KEY`];
     const base = process.env[`LLM${n}_BASE_URL`];
@@ -1452,7 +1467,7 @@ async function isCooling(p: Provider): Promise<boolean> {
   }
 }
 async function coolDown(p: Provider, status: number) {
-  const sec = status === 429 ? 300 : status === 401 || status === 403 || status === 404 ? 3600 : 60;
+  const sec = status === 429 ? 120 : status === 401 || status === 403 || status === 404 ? 3600 : 60;
   try {
     await redis(["SET", `tg:cool:${p.name}`, "1", "EX", sec]);
   } catch {}
@@ -1639,6 +1654,8 @@ function buildTurns(history: Turn[], text: string): ChatTurn[] {
 }
 
 
+const genTemperature = (decls: any[]) => (decls.some((d) => d?.name === "save_note") ? 0.9 : 1.1);
+
 async function callGemini(p: Provider, turns: ChatTurn[], system: string, decls: any[]): Promise<Parsed> {
   const r = await fetchT(
     `https://generativelanguage.googleapis.com/v1beta/models/${p.model}:generateContent`,
@@ -1653,13 +1670,15 @@ async function callGemini(p: Provider, turns: ChatTurn[], system: string, decls:
         })),
         tools: [{ functionDeclarations: decls }],
         toolConfig: { functionCallingConfig: { mode: "ANY", allowedFunctionNames: decls.map((d) => d.name) } },
+        // Для заметок нужна точность (имена, суммы), для болтовни живость
+        generationConfig: { temperature: genTemperature(decls), topP: 0.95 },
         safetySettings: [
           { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_ONLY_HIGH" },
           { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" }, // бот по характеру грубит в ответ, иначе Gemini режет такие ответы и бот молчит
         ],
       }),
     },
-    turns.some((t) => t.media) ? 18000 : 9000
+    turns.some((t) => t.media) ? 18000 : 11000
   );
   const data: any = await r.json().catch(() => ({}));
   if (!r.ok) throw new ProviderError(r.status, String(data?.error?.message ?? "request failed").slice(0, 120));
@@ -1689,6 +1708,7 @@ async function callOpenAI(p: Provider, turns: ChatTurn[], system: string, decls:
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${p.key}` },
       body: JSON.stringify({
         model: p.model,
+        temperature: genTemperature(decls),
         messages: [
           { role: "system", content: system },
           ...turns.map((t) => ({ role: t.role, content: t.text })),
