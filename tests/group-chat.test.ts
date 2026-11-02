@@ -1,6 +1,6 @@
 // Запуск: node --experimental-strip-types group-chat.test.ts   (Node 22.6+)
 import assert from "node:assert/strict";
-import * as GC from "./group-chat.ts";
+import * as GC from "../lib/group-chat.ts";
 
 // история: порядок и пометки рода
 const raw = [

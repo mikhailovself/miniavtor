@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { stripTypeScriptTypes } from "node:module";
 import { runInNewContext } from "node:vm";
-import { EMOJI_CANDIDATES } from "../api/emoji-candidates.ts";
+import { EMOJI_CANDIDATES } from "../lib/emoji-candidates.ts";
 
-const source = readFileSync(new URL("../api/animated-emoji.ts", import.meta.url), "utf8")
+const source = readFileSync(new URL("../lib/animated-emoji.ts", import.meta.url), "utf8")
   .replace(/^import .*\n/gm, "").replace(/^export /gm, "");
 const { animatedEmojiIds, decorateAnimatedEmoji, needsAnimatedEmoji } = runInNewContext(
   `${stripTypeScriptTypes(source)}\n({ animatedEmojiIds, decorateAnimatedEmoji, needsAnimatedEmoji })`,

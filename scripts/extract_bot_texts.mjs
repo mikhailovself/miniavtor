@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const root = resolve(import.meta.dirname, "..");
-const files = ["api/webhook.ts", "api/notes.ts", "api/friends.ts"];
+const files = ["api/webhook.ts", "lib/notes.ts", "lib/friends.ts"];
 
 function* strings(source) {
   let line = 1;

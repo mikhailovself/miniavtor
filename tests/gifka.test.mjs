@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { gifkaCandidates, chooseGifka, gifkaQueries, searchGifka, sendGifkaAnimation, downloadGifka } from '../api/gifka.ts';
+import { gifkaCandidates, chooseGifka, gifkaQueries, searchGifka, sendGifkaAnimation, downloadGifka } from '../lib/gifka.ts';
 import { readFileSync } from 'node:fs';
 import { stripTypeScriptTypes } from 'node:module';
 import { runInNewContext } from 'node:vm';

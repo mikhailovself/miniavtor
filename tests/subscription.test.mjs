@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { stripTypeScriptTypes } from "node:module";
 import { runInNewContext } from "node:vm";
-import { membershipState, checkSubscription, subscriptionKeyboard, subscriptionText } from "../api/subscription.ts";
+import { membershipState, checkSubscription, subscriptionKeyboard, subscriptionText } from "../lib/subscription.ts";
 
 test("channel members can enter; departed and restricted nonmembers cannot", () => {
   for (const status of ["creator", "administrator", "member"]) {
@@ -99,6 +99,8 @@ test("group commands work without a channel subscription", async () => {
   const { handleGroup } = runInNewContext(`${code}\n({ handleGroup })`, {
     REDIS_URL: "https://redis.test", TELEGRAM_BOT_TOKEN: "token",
     checkSubscription: async () => { throw new Error("group membership must not be checked"); },
+    handleBpmWaiting: async () => false,
+    handleAvtorCommand: async () => false,
     sayIn: async (chat, thread, message) => { messages.push({ chat, thread, message }); },
   });
   await handleGroup({ from: { id: 123 }, chat: { id: -123, type: "supergroup" }, text: "/ping" });

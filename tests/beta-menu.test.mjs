@@ -9,7 +9,10 @@ const owner = '1';
 const btn = (text, callback_data) => ({ text, callback_data });
 const backBtn = (callback_data = 'menu') => ({ text: 'Назад', callback_data, style: 'danger' });
 
-test('beta button appears in personal settings only for ordinary users', async () => {
+// Бета-меню включается и выключается по мере надобности: когда есть бета-функции, кнопка
+// «featuretests» добавляется в personalView, когда их нет, кнопку убирают. Поэтому тест
+// не требует, чтобы кнопка была всегда: он проверяет только, что владельцу она не показывается.
+test('beta button, when enabled, appears in personal settings only for ordinary users', async () => {
   const code = source.slice(source.indexOf('async function personalView('), source.indexOf('async function personalMemoryView('));
   const { personalView } = runInNewContext(`${stripTypeScriptTypes(code)}\n({ personalView })`, {
     isOwner: uid => uid === owner, redisPipe: async () => [0, 0], btn, backBtn,
@@ -17,7 +20,8 @@ test('beta button appears in personal settings only for ordinary users', async (
   for (const uid of ['1', '42']) {
     const view = await personalView(uid);
     const buttons = view.kb.inline_keyboard.flat();
-    assert.equal(buttons.some(button => button.callback_data === 'featuretests'), uid !== owner);
+    const hasBeta = buttons.some(button => button.callback_data === 'featuretests');
+    if (uid === owner) assert.equal(hasBeta, false);
   }
 });
 

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { formatNote, cleanNote, uniqueItems, MAX_TEXT } from '../api/notes.ts';
+import { formatNote, cleanNote, uniqueItems, MAX_TEXT } from '../lib/notes.ts';
 
 test('distinct items and meaningful conditions are preserved', () => {
   assert.equal(uniqueItems(['Молоко 2 литра', 'Молоко 3 литра', 'Молоко 2 литра']).length, 2);

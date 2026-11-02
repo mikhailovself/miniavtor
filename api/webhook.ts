@@ -1,15 +1,15 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { waitUntil } from "@vercel/functions";
-import { friendContext, isKnownFriend, friendInfo } from "./friends.js";
-import * as GC from "./group-chat.js";
-import { ROAST_ENGINE, casualToneHint } from "./roast.js";
-import { gifkaQueries, searchGifka, chooseGifka, sendGifkaAnimation, type GifkaCandidate } from "./gifka.js";
-import { animatedEmojiIds, decorateAnimatedEmoji, stripUnanimatedEmoji, needsAnimatedEmoji } from "./animated-emoji.js";
-import { CHANNEL_URL, checkSubscription, subscriptionKeyboard, subscriptionText, type SubscriptionState } from "./subscription.js";
+import { friendContext, isKnownFriend, friendInfo } from "../lib/friends.js";
+import * as GC from "../lib/group-chat.js";
+import { ROAST_ENGINE, casualToneHint } from "../lib/roast.js";
+import { gifkaQueries, searchGifka, chooseGifka, sendGifkaAnimation, type GifkaCandidate } from "../lib/gifka.js";
+import { animatedEmojiIds, decorateAnimatedEmoji, stripUnanimatedEmoji, needsAnimatedEmoji } from "../lib/animated-emoji.js";
+import { CHANNEL_URL, checkSubscription, subscriptionKeyboard, subscriptionText, type SubscriptionState } from "../lib/subscription.js";
 import {
   amendNote, cleanNote, dedupeNotes, esc, findSimilarSaved, formatNote, uniqueItems, MAX_CAPTION, MAX_TEXT,
   type Note, type NoteUpdate, type SavedNote,
-} from "./notes.js";
+} from "../lib/notes.js";
 import { execFile } from "node:child_process";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -1961,6 +1961,9 @@ const subscriptionView = (state: SubscriptionState): View => ({
   kb: subscriptionKeyboard(),
 });
 
+// Бета-меню включается и выключается вручную: когда есть бета-функции, сюда добавляют кнопку
+// btn("🧪 Тесты функций", "featuretests") (только для обычных пользователей, не для владельца),
+// когда бета-функций нет, кнопку убирают. Отсутствие кнопки не ошибка (см. tests/beta-menu.test.mjs).
 async function personalView(uid: string): Promise<View> {
   const [quiet, muted] = await redisPipe([["SISMEMBER", "outreach:muted", uid], ["SISMEMBER", "reminders:muted", uid]]);
   return { text: "<b>⚙️ Для себя</b>\n\n👇 Выбирай, че настроить\n\n⏰ <b>Напоминалки проверяю раз в день</b>\nПока они выключены, пропущенные я не пришлю, сорян", kb: { inline_keyboard: [

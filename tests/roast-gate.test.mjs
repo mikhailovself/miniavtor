@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { stripTypeScriptTypes } from "node:module";
 import { runInNewContext } from "node:vm";
-import { isInsultToBot } from "../api/roast-gate.ts";
+import { isInsultToBot } from "../lib/roast-gate.ts";
 
 test("only insults directed at the bot count", () => {
   assert.equal(isInsultToBot("Ты тупой", true), true);

@@ -1,4 +1,3 @@
-[README.md](https://github.com/user-attachments/files/34294673/README.md)
 # Бот «мини.автор» для Telegram
 
 Telegram-бот на Vercel (Node/TypeScript, вебхук). Три роли:
@@ -25,7 +24,7 @@ Telegram-бот на Vercel (Node/TypeScript, вебхук). Три роли:
 
 ### Файлы проекта
 
-Папка `api/`: `webhook.ts` (вся основная логика), `notes.ts` (оформление и правка заметок), `group-chat.ts` (история группы, обида, действия по просьбе), `friends.ts` (справочник знакомых), `roast.ts` и `roast-gate.ts` (жёсткие подъёбки), `gifka.ts`, `animated-emoji.ts`, `emoji-candidates.ts`, `subscription.ts`. Конвертер лежит отдельно: `mp3-worker/api/convert.py`. Для кружков в `vercel.json` нужен `includeFiles: node_modules/ffmpeg-static/**`, пакет `ffmpeg-static` указан в `package.json`.
+Папка `api/` содержит только `webhook.ts` (вся основная логика): на Hobby-плане Vercel максимум 12 функций, а каждый файл в `api/` считается отдельной функцией. Хелперы лежат в `lib/`: `notes.ts` (оформление и правка заметок), `group-chat.ts` (история группы, обида, действия по просьбе), `friends.ts` (справочник знакомых), `roast.ts` и `roast-gate.ts` (жёсткие подъёбки), `gifka.ts`, `animated-emoji.ts`, `emoji-candidates.ts`, `subscription.ts`. Конвертер лежит отдельно: `mp3-worker/api/convert.py`. Для кружков в `vercel.json` нужен `includeFiles: node_modules/ffmpeg-static/**`, пакет `ffmpeg-static` указан в `package.json`.
 
 ## Нейросети
 
@@ -63,7 +62,7 @@ Telegram-бот на Vercel (Node/TypeScript, вебхук). Три роли:
 | `VLAD_CHAT_PERSONA_BOOST` | усиление: разбор слов собеседника, грубость без смягчений, короткие острые реплики, границы |
 | `VLAD_LORE` | кто такой бот, близкий круг, публичные ссылки |
 | `VLAD_VIEWS` | взгляды и интересы |
-| `ROAST_ENGINE` (`api/roast.ts`) | жёсткие подъёбки, включаются после третьего подряд оскорбления бота |
+| `ROAST_ENGINE` (`lib/roast.ts`) | жёсткие подъёбки, включаются после третьего подряд оскорбления бота |
 | `TEXT_STYLE_RULE` | единый голос всех текстов бота |
 | `NOTE_STYLE` | заметки пишутся аккуратно, без мата и опечаток |
 | `GROUP_RULES` | поведение в групповом чате |
@@ -254,7 +253,7 @@ Telegram-бот на Vercel (Node/TypeScript, вебхук). Три роли:
 | Что менять | Где |
 |---|---|
 | выбор топика, дополнение, списки | `buildSystemPrompt` |
-| оформление заметок | `NOTE_STYLE` и `api/notes.ts` |
+| оформление заметок | `NOTE_STYLE` и `lib/notes.ts` |
 | манера, грубость, острота | `VLAD_CHAT_PERSONA_BASE`, `VLAD_CHAT_PERSONA_BOOST` |
 | личность, ссылки | `VLAD_LORE` |
 | взгляды | `VLAD_VIEWS` |
