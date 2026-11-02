@@ -218,7 +218,7 @@ async function tg(method: string, payload: Record<string, unknown>, upload?: { f
   }
   const canDecorate = /^(sendMessage|editMessageText|sendPhoto|sendVideo|sendAnimation|sendDocument|sendAudio|sendVoice|sendSticker|sendVideoNote|sendMediaGroup|editMessageMedia|editMessageCaption|copyMessage|editMessageReplyMarkup)$/.test(method);
   const decorated = canDecorate
-    ? decorateAnimatedEmoji(method, source, needsAnimatedEmoji(source) ? await animatedEmojiIds(TELEGRAM_BOT_TOKEN, {
+    ? decorateAnimatedEmoji(method, source, needsAnimatedEmoji(source) ? await animatedEmojiIds(TELEGRAM_BOT_TOKEN ?? "", {
       read: () => redis(["GET", `ui:animated:v1:${BOT_ID}`]),
       write: value => redis(["SET", `ui:animated:v1:${BOT_ID}`, value, "EX", 21600]),
     }) : new Map())
@@ -296,7 +296,7 @@ async function makeCircle(fileId: string, chatId: number | string, duration?: nu
     if (!path) return false;
     const download = await fetchT(`https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${path}`, {}, 8000);
     if (!download.ok) return false;
-    await writeFile(input, Buffer.from(await download.arrayBuffer()));
+    await writeFile(input, new Uint8Array(await download.arrayBuffer()));
     const ffmpeg = ffmpegPath;
     await new Promise<void>((resolve, reject) => execFile(ffmpeg, [
       "-y", "-i", input, "-t", "60",
@@ -308,7 +308,7 @@ async function makeCircle(fileId: string, chatId: number | string, duration?: nu
     form.append("chat_id", String(chatId));
     form.append("length", "384");
     if (duration) form.append("duration", String(Math.min(60, Math.round(duration))));
-    form.append("video_note", new Blob([await readFile(output)], { type: "video/mp4" }), "circle.mp4");
+    form.append("video_note", new Blob([new Uint8Array(await readFile(output))], { type: "video/mp4" }), "circle.mp4");
     const sent = await fetchT(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVideoNote`, { method: "POST", body: form }, 8000);
     const data: any = await sent.json().catch(() => ({}));
     if (!data.ok) console.error("sendVideoNote", data);
@@ -2707,7 +2707,7 @@ async function handleCallback(cb: any) {
   const chatId = cb.message?.chat?.id;
   const mid = cb.message?.message_id;
   if (uid && chatId && cb.message?.chat?.type === "private") {
-    const state = await checkSubscription(TELEGRAM_BOT_TOKEN, Number(uid));
+    const state = await checkSubscription(TELEGRAM_BOT_TOKEN ?? "", Number(uid));
     if (String(cb.data ?? "") === "subcheck") {
       if (state === "subscribed") {
         await ack(cb.message?.chat?.type === "private" ? "✅ Вижу подписку. Погнали!" : "✅ Вижу подписку. Позови меня ещё раз!");
@@ -4194,7 +4194,7 @@ async function handleInlineQuery(iq: any) {
   // Та же подписка на канал, что и в личке; успешную проверку помним 2 минуты.
   const subKey = `inl:sub:${uid}`;
   if (!(await redis(["GET", subKey]))) {
-    const state = await checkSubscription(TELEGRAM_BOT_TOKEN, uid);
+    const state = await checkSubscription(TELEGRAM_BOT_TOKEN ?? "", uid);
     if (state !== "subscribed") {
       await answer([inlineArticle("sub", "Сначала подпишись на канал", "Без подписки не работаю", esc(subscriptionText(state)), subscriptionKeyboard())]);
       return;
@@ -4545,7 +4545,7 @@ async function handlePrivate(msg: any) {
     return result;
   };
 
-  const subscription = await checkSubscription(TELEGRAM_BOT_TOKEN, Number(uid));
+  const subscription = await checkSubscription(TELEGRAM_BOT_TOKEN ?? "", Number(uid));
   if (subscription !== "subscribed") {
     if (/^\/start(?:@\w+)?(?:\s|$)/i.test(String(msg.text ?? "").trim())) {
       await sendView(chatId, subscriptionView(subscription));
