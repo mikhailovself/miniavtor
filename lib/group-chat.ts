@@ -56,7 +56,7 @@ export function formatHistory(lines: GroupLine[]): string {
   if (!lines.length) return "(пока пусто)";
   return lines.map((l) => {
     const who = l.bot ? "МИНИ.АВТОР (это ты)" : `${l.name}${FORM_LABEL[l.form]}`;
-    return `${who}${l.to ? ` → ${l.to}` : ""}: ${l.text}`;
+    return `${l.mid ? `[#${l.mid}] ` : ""}${who}${l.to ? ` → ${l.to}` : ""}: ${l.text}`;
   }).join("\n");
 }
 
@@ -132,10 +132,14 @@ export const WITHDRAW_CHAT_FALLBACK = [
 // ───────────────────────── обида ─────────────────────────
 export const NEGATIVE_REACTIONS = ["👎", "🤡", "💩", "🥱", "🗿", "🌚", "🤨", "😐", "🤮", "😴"] as const;
 
-// Пока бот обижен: примерно 55% обращений игнорируются совсем, остальные получают негативную реакцию.
-export function sulkAction(rnd: () => number = Math.random): { kind: "ignore" } | { kind: "react"; emoji: string } {
-  if (rnd() < 0.55) return { kind: "ignore" };
-  return { kind: "react", emoji: NEGATIVE_REACTIONS[Math.floor(rnd() * NEGATIVE_REACTIONS.length)] };
+// Пока бот обижен: ~40% обращений игнорируются совсем, ~35% получают негативную реакцию,
+// ~25% получают «я уже всё сказал»: бот пересылает своё прошлое сообщение и ставит точку.
+export type SulkAction = { kind: "ignore" } | { kind: "react"; emoji: string } | { kind: "dot" };
+export function sulkAction(rnd: () => number = Math.random): SulkAction {
+  const r = rnd();
+  if (r < 0.4) return { kind: "ignore" };
+  if (r < 0.75) return { kind: "react", emoji: NEGATIVE_REACTIONS[Math.floor(rnd() * NEGATIVE_REACTIONS.length)] };
+  return { kind: "dot" };
 }
 
 // ───────────────────────── имена и род ─────────────────────────
@@ -176,6 +180,7 @@ export function formRule(form: Form, name: string): string {
 }
 
 // ───────────────────────── действия по просьбе ─────────────────────────
+export const DICE_EMOJIS = ["🎲", "🎯", "🏀", "⚽", "🎳", "🎰"] as const;
 export const REACT_CHOICES = ["👍", "👎", "❤", "🔥", "👏", "🎉", "🤔", "🤯", "😱", "😢", "🤡", "💩", "🥱", "🗿", "🌚", "🤨", "😐", "😁", "🤣", "😈", "💯", "👀", "🙈", "😎", "🤪", "🥴"] as const;
 
 const ONLY_ON_REQUEST = "Вызывай ТОЛЬКО если человек в последнем сообщении прямо просит об этом (или ты сам решил это кинуть как часть ответа). Всегда вместе с chat_reply: короткая реплика в твоём стиле, а если слова не нужны, text = «-».";
@@ -199,7 +204,7 @@ export const GROUP_ACTION_DECLARATIONS = [
   {
     name: "react",
     description: `Поставить эмодзи-реакцию на сообщение (на то, что просят, или на сообщение человека). ${ONLY_ON_REQUEST}`,
-    parameters: { type: "object", properties: { emoji: { type: "string", enum: [...REACT_CHOICES] } }, required: ["emoji"] },
+    parameters: { type: "object", properties: { emoji: { type: "string", enum: [...REACT_CHOICES] }, message_id: { type: "integer", description: "Необязательно: номер сообщения из истории (число из [#123]), на которое поставить реакцию. По умолчанию текущее." } }, required: ["emoji"] },
   },
   {
     name: "remember_fact",
@@ -216,6 +221,36 @@ export const GROUP_ACTION_DECLARATIONS = [
     description: `Переслать случайный пост из канала автора. ${ONLY_ON_REQUEST}`,
     parameters: { type: "object", properties: { note: { type: "string" } } },
   },
+  {
+    name: "reply_to",
+    description: "Ответить реплаем не на текущее сообщение, а на более раннее из истории (номер в [#123]). Вызывай вместе с chat_reply, когда твоя реплика относится к конкретному прошлому сообщению или человеку, который писал раньше. Если отвечаешь на текущее, не вызывай.",
+    parameters: { type: "object", properties: { message_id: { type: "integer", description: "Число из [#123] в истории." } }, required: ["message_id"] },
+  },
+  {
+    name: "send_poll",
+    description: "ОЧЕНЬ РЕДКО. Создать в чате опрос. Вызывай только если контекст беседы максимально подходит (люди спорят «что лучше», выбирают, делят мнения) и опрос реально смешной или уместный. В обычной ситуации НЕ вызывай. Вместе с chat_reply (короткая подводка) или без неё.",
+    parameters: { type: "object", properties: { question: { type: "string", description: "Вопрос опроса, до 200 символов, в твоём стиле." }, options: { type: "array", items: { type: "string" }, description: "От 2 до 5 вариантов, коротко, смешно." } }, required: ["question", "options"] },
+  },
+  {
+    name: "send_dice",
+    description: "ОЧЕНЬ РЕДКО. Кинуть в чат анимированный кубик/мяч/дартс/боулинг/слот. Вызывай только когда это максимально в тему (спор на что-то, «а давай на удачу», кто-то просит кубик или азарт). В обычной ситуации НЕ вызывай.",
+    parameters: { type: "object", properties: { emoji: { type: "string", enum: [...DICE_EMOJIS] } }, required: ["emoji"] },
+  },
+  {
+    name: "edit_own",
+    description: "РЕДКО. Переписать свою только что отправленную реплику (самоисправление: «а нет, хотел сказать…», уточнить, довести шутку). Вызывай, только если это смешно или естественно. Новый текст в text.",
+    parameters: { type: "object", properties: { text: { type: "string", description: "Новый текст своей последней реплики." } }, required: ["text"] },
+  },
+  {
+    name: "delete_own",
+    description: "РЕДКО. Удалить свою последнюю реплику через пару секунд, как будто пожалел, что написал («забудьте, что я сказал»). Вызывай только если это в тему, иначе не вызывай.",
+    parameters: { type: "object", properties: { note: { type: "string" } } },
+  },
+  {
+    name: "stay_silent",
+    description: "Ты реально сыт по горло: человек оскорбляет, доёбывается или обидел тебя. Вызови ТОЛЬКО эту функцию (без chat_reply): ты молча обижаешься, дальше на этого человека реагируешь реакциями или игнором, пока не извинится. Для обычного подъёба, шутки или лёгкой грубости НЕ вызывай.",
+    parameters: { type: "object", properties: { reason: { type: "string" } } },
+  },
 ] as const;
 
 export const GROUP_ACTION_NAMES: ReadonlySet<string> = new Set(GROUP_ACTION_DECLARATIONS.map((d) => d.name));
@@ -228,4 +263,73 @@ export const MEME_KINDS: Record<string, string[]> = { any: ["p", "v", "a", "s"],
 export function pickByKind(pool: string[], kinds: string[], last?: string | null): string | null {
   const ok = pool.filter((x) => typeof x === "string" && kinds.includes(x[0]) && x[1] === ":");
   return ok.find((x) => x !== last) ?? ok[0] ?? null;
+}
+
+
+// ───────────────────────── самостоятельные действия ─────────────────────────
+// Какие функции показать модели в этом запросе. Опрос, кубики, правка и удаление своих реплик очень редкие:
+// без явной просьбы человека модель видит их лишь в небольшой доле запросов, остальное время их просто нет.
+export const POLL_CHANCE = 0.04;
+export const DICE_CHANCE = 0.04;
+export const OWN_CHANCE = 0.07;
+const POLL_ASK = /(?:опрос|голосован|проголосу)/i;
+const DICE_ASK = /(?:кубик|кость|кинь\s+монет|подкинь\s+монет|казино|дартс|боулинг|слот)/i;
+
+export const REACT_AUTO_DECLARATION = {
+  name: "react",
+  description: "Поставить эмодзи-реакцию на сообщение из истории (номер в [#123]) или на текущее, если реакция уместнее слов или добавляет к ответу. Не ставь реакцию на каждое сообщение.",
+  parameters: { type: "object", properties: { emoji: { type: "string", enum: [...REACT_CHOICES] }, message_id: { type: "integer", description: "Необязательно: число из [#123]. По умолчанию текущее сообщение." } }, required: ["emoji"] },
+} as const;
+
+type Decl = { name: string };
+export function pickActionDecls(ctx: { addressed: boolean; text: string; heated: boolean; rnd?: () => number }): Decl[] {
+  const rnd = ctx.rnd ?? Math.random;
+  const by = (name: string) => GROUP_ACTION_DECLARATIONS.find((d) => d.name === name) as Decl;
+  const out: Decl[] = ctx.addressed
+    ? GROUP_ACTION_DECLARATIONS.filter((d) => !["reply_to", "send_poll", "send_dice", "edit_own", "delete_own", "stay_silent"].includes(d.name)) as Decl[]
+    : [REACT_AUTO_DECLARATION];
+  out.push(by("reply_to"));
+  if (POLL_ASK.test(ctx.text) || rnd() < POLL_CHANCE) out.push(by("send_poll"));
+  if (DICE_ASK.test(ctx.text) || rnd() < DICE_CHANCE) out.push(by("send_dice"));
+  if (rnd() < OWN_CHANCE) out.push(by("edit_own"), by("delete_own"));
+  if (ctx.addressed && ctx.heated) out.push(by("stay_silent"));
+  return out;
+}
+
+// Номер из [#123] должен быть в показанной истории, и сообщение не должно быть сообщением самого бота.
+export function validMessageId(id: unknown, history: GroupLine[], allowBot = false): number | null {
+  const n = Number(id);
+  if (!Number.isSafeInteger(n) || n <= 0) return null;
+  const line = history.find((l) => l.mid === n);
+  if (!line) return null;
+  if (line.bot && !allowBot) return null;
+  return n;
+}
+
+export function sanitizePoll(args: Record<string, any>): { question: string; options: string[] } | null {
+  const question = String(args?.question ?? "").replace(/\s+/g, " ").trim().slice(0, 250);
+  const raw = Array.isArray(args?.options) ? args.options : [];
+  const seen = new Set<string>();
+  const options: string[] = [];
+  for (const o of raw) {
+    const t = String(o ?? "").replace(/\s+/g, " ").trim().slice(0, 100);
+    if (!t || seen.has(t.toLowerCase())) continue;
+    seen.add(t.toLowerCase());
+    options.push(t);
+    if (options.length >= 5) break;
+  }
+  if (question.length < 3 || options.length < 2) return null;
+  return { question, options };
+}
+
+export function isDiceEmoji(x: unknown): x is (typeof DICE_EMOJIS)[number] {
+  return typeof x === "string" && (DICE_EMOJIS as readonly string[]).includes(x);
+}
+
+// Свежая реплика бота (не пометка вроде «[кинул стикер]») для правки, удаления и «я уже всё сказал».
+export function lastBotMessageId(history: GroupLine[], now: number, maxAgeMs = 15 * 60 * 1000): number | null {
+  for (const l of history) {
+    if (l.bot && l.mid && !l.text.startsWith("[") && now - l.ts <= maxAgeMs) return l.mid;
+  }
+  return null;
 }
